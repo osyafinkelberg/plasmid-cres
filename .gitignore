@@ -69,5 +69,4 @@ Thumbs.db
 # Local utility scripts and outputs
 # ============================================================
 parse_deps.py
-deps_output_requirements.txt
-deps_output_toml.txt
+deps_output*.txt
