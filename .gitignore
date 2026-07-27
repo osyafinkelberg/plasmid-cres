@@ -34,6 +34,7 @@ conda-meta/
 # ============================================================
 .ipynb_checkpoints/
 **/.ipynb_checkpoints/
+notebooks/test.ipynb
 
 # ============================================================
 # Data directory
