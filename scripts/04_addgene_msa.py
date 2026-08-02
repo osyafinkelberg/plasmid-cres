@@ -70,7 +70,9 @@ def extract_subtypes_to_fasta() -> None:
             if len(sequence) < SEQ_LEN_THRESH:
                 continue
 
-            seq_collections[sanitized_id].append((sequence, record.name, element_type, element_name))
+            position = [[int(p.start), int(p.end)] for p in feat.location.parts]
+            strand = feat.location.strand if feat.location.strand is not None else 1
+            seq_collections[sanitized_id].append((sequence, record.name, element_type, element_name, position, strand))
 
     unique_id_rows = []
     for sid, entries in seq_collections.items():
@@ -79,12 +81,15 @@ def extract_subtypes_to_fasta() -> None:
 
         # Group by unique sequence, preserving first-seen order
         seq_to_gbk_names = defaultdict(list)
-        for sequence, gbk_name, _, _ in entries:
-            seq_to_gbk_names[sequence].append(gbk_name)
+        for sequence, gbk_name, _, _, position, strand in entries:
+            seq_to_gbk_names[sequence].append((gbk_name, position, strand))
 
         fasta_lines = []
-        for idx, (seq, gbk_names) in enumerate(seq_to_gbk_names.items()):
+        for idx, (seq, instances) in enumerate(seq_to_gbk_names.items()):
             unique_id = f"{sid}|||{idx}"
+            gbk_names = [inst[0] for inst in instances]
+            positions = [inst[1] for inst in instances]
+            strands = [inst[2] for inst in instances]
             fasta_lines.append(f">{unique_id}\n{seq}\n")
             unique_id_rows.append({
                 "element_type": element_type,
@@ -92,6 +97,8 @@ def extract_subtypes_to_fasta() -> None:
                 "unique_id": unique_id,
                 "sanitized_name": sid,
                 "gbk_names": gbk_names,
+                "positions": positions,
+                "strands": strands,
                 "n_instances": len(gbk_names)
             })
 
@@ -140,7 +147,9 @@ def extract_cds_aa_to_fasta() -> None:
             if not aa_sequence:
                 continue
 
-            seq_collections[sanitized_id].append((aa_sequence, record.name, element_type, element_name))
+            position = [[int(p.start), int(p.end)] for p in feat.location.parts]
+            strand = feat.location.strand if feat.location.strand is not None else 1
+            seq_collections[sanitized_id].append((aa_sequence, record.name, element_type, element_name, position, strand))
 
     unique_id_rows = []
     for sid, entries in seq_collections.items():
@@ -149,12 +158,15 @@ def extract_cds_aa_to_fasta() -> None:
 
         # Group by unique sequence, preserving first-seen order
         seq_to_gbk_names = defaultdict(list)
-        for aa_sequence, gbk_name, _, _ in entries:
-            seq_to_gbk_names[aa_sequence].append(gbk_name)
+        for aa_sequence, gbk_name, _, _, position, strand in entries:
+            seq_to_gbk_names[aa_sequence].append((gbk_name, position, strand))
 
         fasta_lines = []
-        for idx, (seq, gbk_names) in enumerate(seq_to_gbk_names.items()):
-            unique_id = f"{sid}|||{idx}"
+        for idx, (seq, instances) in enumerate(seq_to_gbk_names.items()):
+            unique_id = f"{sid}|||aa_{idx}"
+            gbk_names = [inst[0] for inst in instances]
+            positions = [inst[1] for inst in instances]
+            strands = [inst[2] for inst in instances]
 
             # Find all corresponding nucleotide unique IDs (multiple NT seqs may share an AA seq)
             seen_nuc_ids = set()
@@ -172,8 +184,11 @@ def extract_cds_aa_to_fasta() -> None:
                 "unique_id": unique_id,
                 "sanitized_name": sid,
                 "gbk_names": gbk_names,
+                "positions": positions,
+                "strands": strands,
                 "n_instances": len(gbk_names),
-                "unique_nuc_ids": unique_nuc_ids
+                "unique_nuc_ids": unique_nuc_ids,
+                "n_unique_nuc_ids": len(unique_nuc_ids),
             })
 
         with open(FASTA_CDS_DIR / f"{sid}.fasta", "w") as f:
@@ -294,101 +309,23 @@ def make_and_analyze_msa_cds():
     aggregated_metrics = []
     errors_log = []
 
-    # Load unique sequence ID metadata for lookup
-    uid_nt_meta = {
-        row["unique_id"]: (row["element_type"], row["element_name"], row["n_instances"])
-        for row in pl.read_parquet(OUT_UNIQUE_SEQUENCE_IDS).filter(pl.col("element_type") == "CDS").iter_rows(named=True)
-    }
+    # Load unique AA sequence ID metadata for lookup
     uid_aa_meta = {
-        row["unique_id"]: (row["element_type"], row["element_name"], row["n_instances"])
+        row["unique_id"]: (row["element_type"], row["element_name"], row["n_instances"], row["unique_nuc_ids"], row["n_unique_nuc_ids"])
         for row in pl.read_parquet(OUT_UNIQUE_SEQUENCE_IDS_CDS).iter_rows(named=True)
     }
+
+    # Load all CDS NT sequences into memory for codon-aware divergence computation
+    uid_nt_seq = {}
+    for fasta_nt_file in sorted(FASTA_DIR.glob("CDS__*.fasta")):
+        for record in SeqIO.parse(fasta_nt_file, "fasta"):
+            uid_nt_seq[record.id] = str(record.seq).upper()
 
     fasta_cds_files = sorted(FASTA_CDS_DIR.glob("*.fasta"))
     for fasta_cds_file in tqdm(fasta_cds_files, desc="Aligning CDS and generating PWMs"):
         current_file_stem = fasta_cds_file.stem
-        fasta_nt_file = FASTA_DIR / fasta_cds_file.name
 
-        # 1. Codon-aware nucleotide alignment (sequences from FASTA_DIR, saved as .codon.aln)
-        codon_aln_file = FASTA_CDS_DIR / f"{current_file_stem}.codon.aln"
-
-        if not codon_aln_file.exists():
-            command = f"module load mafft/7.305 && mafft --codon --auto {fasta_nt_file!s}"
-            try:
-                with open(codon_aln_file, "w") as out:
-                    subprocess.run(command, shell=True, check=True, stdout=out, stderr=subprocess.DEVNULL)
-            except Exception as e:  # noqa: BLE001
-                errors_log.append({"file_name": current_file_stem, "error_loc": "mafft codon run", "error": str(e)})
-            finally:
-                if codon_aln_file.exists() and codon_aln_file.stat().st_size == 0:
-                    codon_aln_file.unlink()
-
-        if codon_aln_file.exists():
-            try:
-                alignment = AlignIO.read(codon_aln_file, "fasta")
-                for record in alignment:
-                    record.seq = record.seq.upper()
-            except Exception as e:  # noqa: BLE001
-                errors_log.append({"file_name": current_file_stem, "error_loc": "read codon alignment", "error": str(e)})
-                alignment = None
-
-            if alignment is not None and len(alignment) >= 2:
-                m = motifs.create(alignment)
-                try:
-                    consensus_seq = m.counts.calculate_consensus(identity=0.5)
-                except Exception as e:  # noqa: BLE001
-                    errors_log.append({"file_name": current_file_stem, "error_loc": "calc codon consensus", "error": str(e)})
-                    consensus_seq = None
-
-                if consensus_seq is not None:
-                    consensus_str = str(consensus_seq)
-
-                    # optimization: Convert consensus to byte array once for fast vectorized comparisons
-                    c_arr = np.frombuffer(consensus_str.encode(), dtype='S1')
-                    identities = []
-                    n_instances_total = 0
-
-                    # Calculate Divergence Metrics
-                    for record in alignment:
-                        unique_id = record.description
-                        element_type, element_name, n_instances = uid_nt_meta[unique_id]
-                        file_name = unique_id.split("|||")[0]
-
-                        seq_str = str(record.seq)
-                        s_arr = np.frombuffer(seq_str.encode(), dtype='S1')
-
-                        # Vectorized character comparison
-                        valid_mask = (s_arr != b'-') & (c_arr != b'-')
-                        matches = np.sum(s_arr[valid_mask] == c_arr[valid_mask])
-                        valid_positions = np.sum(valid_mask)
-
-                        ind_identity = matches / valid_positions if valid_positions > 0 else 0
-                        identities.append(ind_identity)
-                        n_instances_total += n_instances
-
-                        individual_metrics.append({
-                            "element_type": element_type,
-                            "element_name": element_name,
-                            "file_name": file_name,
-                            "unique_id": unique_id,
-                            "n_instances": n_instances,
-                            "identity_to_consensus": ind_identity,
-                            "alignment_type": "codon_nt"
-                        })
-
-                    aggregated_metrics.append({
-                        "element_type": element_type,  # uses the last extracted type/name, valid as they are grouped by file
-                        "element_name": element_name,
-                        "file_name": file_name,
-                        "consensus_seq": consensus_str,
-                        "avg_identity": float(np.mean(identities)),
-                        "n_instances_total": n_instances_total,
-                        "n_instances_unique": len(alignment),
-                        "alignment_length": alignment.get_alignment_length(),
-                        "alignment_type": "codon_nt"
-                    })
-
-        # 2. Amino acid alignment (sequences from FASTA_CDS_DIR)
+        # 1. Amino acid alignment (sequences from FASTA_CDS_DIR)
         aa_aln_file = fasta_cds_file.with_suffix(".aln")
 
         if not aa_aln_file.exists():
@@ -402,81 +339,119 @@ def make_and_analyze_msa_cds():
                 if aa_aln_file.exists() and aa_aln_file.stat().st_size == 0:
                     aa_aln_file.unlink()
 
-        if aa_aln_file.exists():
-            try:
-                alignment = AlignIO.read(aa_aln_file, "fasta")
-                for record in alignment:
-                    record.seq = record.seq.upper()
-            except Exception as e:  # noqa: BLE001
-                errors_log.append({"file_name": current_file_stem, "error_loc": "read aa alignment", "error": str(e)})
-                alignment = None
+        if not aa_aln_file.exists():
+            continue
 
-            if alignment is not None and len(alignment) >= 2:
-                # For amino acid alignments, compute consensus manually (motifs module is DNA-specific)
-                try:
-                    aln_len = alignment.get_alignment_length()
-                    consensus_chars = []
-                    for i in range(aln_len):
-                        col = [str(rec.seq[i]) for rec in alignment]
-                        non_gap = [c for c in col if c != '-']
-                        if not non_gap:
-                            consensus_chars.append('-')
-                            continue
-                        aa_counts = defaultdict(int)
-                        for c in non_gap:
-                            aa_counts[c] += 1
-                        best = max(aa_counts, key=aa_counts.get)
-                        consensus_chars.append(best if aa_counts[best] / len(non_gap) >= 0.5 else 'X')
-                    consensus_str = ''.join(consensus_chars)
-                except Exception as e:  # noqa: BLE001
-                    errors_log.append({"file_name": current_file_stem, "error_loc": "calc aa consensus", "error": str(e)})
-                    consensus_str = None
+        # 2. Load the Alignment
+        try:
+            alignment = AlignIO.read(aa_aln_file, "fasta")
+            for record in alignment:
+                record.seq = record.seq.upper()
+        except Exception as e:  # noqa: BLE001
+            errors_log.append({"file_name": current_file_stem, "error_loc": "read aa alignment", "error": str(e)})
+            continue
 
-                if consensus_str is not None:
-                    # optimization: Convert consensus to byte array once for fast vectorized comparisons
-                    c_arr = np.frombuffer(consensus_str.encode(), dtype='S1')
-                    identities = []
-                    n_instances_total = 0
+        if len(alignment) < 2:
+            continue
 
-                    # Calculate Divergence Metrics
-                    for record in alignment:
-                        unique_id = record.description
-                        element_type, element_name, n_instances = uid_aa_meta[unique_id]
-                        file_name = unique_id.split("|||")[0]
+        # 3. Compute AA consensus manually (motifs module is DNA-specific)
+        try:
+            aln_len = alignment.get_alignment_length()
+            consensus_chars = []
+            for i in range(aln_len):
+                col = [str(rec.seq[i]) for rec in alignment]
+                non_gap = [c for c in col if c != '-']
+                if not non_gap:
+                    consensus_chars.append('-')
+                    continue
+                aa_counts = defaultdict(int)
+                for c in non_gap:
+                    aa_counts[c] += 1
+                best = max(aa_counts, key=aa_counts.get)
+                consensus_chars.append(best if aa_counts[best] / len(non_gap) >= 0.5 else 'X')
+            consensus_str = ''.join(consensus_chars)
+        except Exception as e:  # noqa: BLE001
+            errors_log.append({"file_name": current_file_stem, "error_loc": "calc aa consensus", "error": str(e)})
+            continue
 
-                        seq_str = str(record.seq)
-                        s_arr = np.frombuffer(seq_str.encode(), dtype='S1')
+        # optimization: Convert consensus to byte array once for fast vectorized comparisons
+        c_arr = np.frombuffer(consensus_str.encode(), dtype='S1')
+        identities = []
+        n_instances_total = 0
 
-                        # Vectorized character comparison
-                        valid_mask = (s_arr != b'-') & (c_arr != b'-')
-                        matches = np.sum(s_arr[valid_mask] == c_arr[valid_mask])
-                        valid_positions = np.sum(valid_mask)
+        # 4. Calculate Divergence Metrics
+        for record in alignment:
+            unique_id = record.description
+            element_type, element_name, n_instances, unique_nuc_ids, n_unique_nuc_ids = uid_aa_meta[unique_id]
+            file_name = unique_id.split("|||")[0]
 
-                        ind_identity = matches / valid_positions if valid_positions > 0 else 0
-                        identities.append(ind_identity)
-                        n_instances_total += n_instances
+            seq_str = str(record.seq)
+            s_arr = np.frombuffer(seq_str.encode(), dtype='S1')
 
-                        individual_metrics.append({
-                            "element_type": element_type,
-                            "element_name": element_name,
-                            "file_name": file_name,
-                            "unique_id": unique_id,
-                            "n_instances": n_instances,
-                            "identity_to_consensus": ind_identity,
-                            "alignment_type": "aa"
-                        })
+            # Vectorized character comparison (AA identity to consensus)
+            valid_mask = (s_arr != b'-') & (c_arr != b'-')
+            matches = np.sum(s_arr[valid_mask] == c_arr[valid_mask])
+            valid_positions = np.sum(valid_mask)
 
-                    aggregated_metrics.append({
-                        "element_type": element_type,  # uses the last extracted type/name, valid as they are grouped by file
-                        "element_name": element_name,
-                        "file_name": file_name,
-                        "consensus_seq": consensus_str,
-                        "avg_identity": float(np.mean(identities)),
-                        "n_instances_total": n_instances_total,
-                        "n_instances_unique": len(alignment),
-                        "alignment_length": alignment.get_alignment_length(),
-                        "alignment_type": "aa"
-                    })
+            aa_identity = matches / valid_positions if valid_positions > 0 else 0
+            identities.append(aa_identity)
+            n_instances_total += n_instances
+
+            # 5. Codon-aware NT divergence: NT seqs encoding this AA are implicitly aligned
+            # (coding length = 3 * aa_len, identical across all seqs encoding the same AA)
+            aa_len = int(np.sum(s_arr != b'-'))
+            coding_len = aa_len * 3
+
+            nt_coding_seqs = []
+            for nuc_id in unique_nuc_ids:
+                nt_seq = uid_nt_seq.get(nuc_id)
+                if nt_seq is not None and len(nt_seq) >= coding_len:
+                    nt_coding_seqs.append(nt_seq[:coding_len])
+
+            if not nt_coding_seqs:
+                nuc_avg_identity = None
+            elif len(nt_coding_seqs) == 1:
+                nuc_avg_identity = 1.0
+            else:
+                # Build position-wise consensus of the coding NT sequences
+                nt_consensus_chars = []
+                for i in range(coding_len):
+                    nt_col_counts = defaultdict(int)
+                    for s in nt_coding_seqs:
+                        nt_col_counts[s[i]] += 1
+                    best_nt = max(nt_col_counts, key=nt_col_counts.get)
+                    nt_consensus_chars.append(best_nt if nt_col_counts[best_nt] / len(nt_coding_seqs) >= 0.5 else 'N')
+                nt_consensus = ''.join(nt_consensus_chars)
+
+                # optimization: Convert NT consensus to byte array once for fast vectorized comparisons
+                nt_c_arr = np.frombuffer(nt_consensus.encode(), dtype='S1')
+                nt_identities = []
+                for nt_seq in nt_coding_seqs:
+                    nt_s_arr = np.frombuffer(nt_seq.encode(), dtype='S1')
+                    nt_identities.append(float(np.mean(nt_s_arr == nt_c_arr)))
+                nuc_avg_identity = float(np.mean(nt_identities))
+
+            individual_metrics.append({
+                "element_type": element_type,
+                "element_name": element_name,
+                "file_name": file_name,
+                "unique_id": unique_id,
+                "n_instances": n_instances,
+                "n_unique_nuc_ids": n_unique_nuc_ids,
+                "aa_identity_to_consensus": aa_identity,
+                "nuc_avg_identity": nuc_avg_identity
+            })
+
+        aggregated_metrics.append({
+            "element_type": element_type,  # uses the last extracted type/name, valid as they are grouped by file
+            "element_name": element_name,
+            "file_name": file_name,
+            "consensus_seq": consensus_str,
+            "avg_identity": float(np.mean(identities)),
+            "n_instances_total": n_instances_total,
+            "n_instances_unique": len(alignment),
+            "alignment_length": alignment.get_alignment_length()
+        })
 
     # Save outputs
     pl.DataFrame(individual_metrics).write_parquet(OUT_INDIVIDUAL_DIVERGENCE_CDS)
@@ -676,8 +651,8 @@ if __name__ == "__main__":
     )
     N_PLASMIDS = plasmid_citations.height
 
-    extract_subtypes_to_fasta()  # 1 min
-    extract_cds_aa_to_fasta()  # 1 min
+    extract_subtypes_to_fasta()  # 1.5 min
+    extract_cds_aa_to_fasta()  # 1.5 min
     make_and_analyze_msa()  # 17 min (Gold-6242 CPU)
-    make_and_analyze_msa_cds()  # 6 min (Gold-6242 CPU)
+    make_and_analyze_msa_cds()  # 4 min (Gold-6242 CPU)
     # get_representative_sequence(plasmid_citations, REPRESENT_FLANK_SIZE)  # 8 min
