@@ -1,8 +1,9 @@
+import re
 import typing as tp
 from pathlib import Path
+
 import h5py
 import numpy as np
-import re
 from Bio import SeqIO
 from PIL import Image
 
@@ -56,6 +57,23 @@ def extract_genbank_record_by_name(input_file: Path, record_name: str, output_fi
                     return True
 
     return False  # Record name not found
+
+
+def load_stap_tracks(path: Path) -> dict[int, tuple[dict[str, str], np.ndarray]]:
+    """Parse mapped/PMID-*.txt into {addgene_id: (header fields, per-bp counts)}.
+
+    Two lines per plasmid: a `>key=value|...` header, then one integer per bp
+    (position 1 first). Counts are deduplicated forward-strand molecules.
+    """
+    tracks = {}
+    with open(path) as fh:
+        for line in fh:
+            if not line.startswith(">"):
+                continue
+            header = dict(kv.split("=", 1) for kv in line[1:].strip().split("|"))
+            counts = np.array(next(fh).strip().split(","), dtype=np.int64)
+            tracks[int(header["plasmid"].split("-")[1])] = (header, counts)
+    return tracks
 
 
 def load_representative_sequences(fasta_path: Path | str) -> dict[tuple[str, str], dict[str, tp.Any]]: 
@@ -140,7 +158,7 @@ def has_sufficient_flank(
     element_type: str, 
     element_name: str, 
     flank_size: int, 
-    h5_path: tp.Union[str, Path]
+    h5_path: str | Path
 ) -> bool:
     """
     Checks if an element is already stored in the H5 file with an equal 
@@ -170,7 +188,7 @@ def save_aligned_predictions_h5(
     pred_matrix: np.ndarray,
     pred_fwd_matrix: np.ndarray,
     pred_rev_matrix: np.ndarray,
-    h5_path: tp.Union[str, Path]
+    h5_path: str | Path
 ) -> None:
     """
     Saves all structural, binary, and continuous prediction matrices to the H5 file.
@@ -205,8 +223,8 @@ def save_aligned_predictions_h5(
 def load_aligned_predictions_h5(
     element_type: str,
     element_name: str,
-    h5_path: tp.Union[str, Path]
-) -> tp.Tuple[int, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    h5_path: str | Path
+) -> tuple[int, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Loads the flank size and all 7 associated matrices for a specific plasmid element.
 

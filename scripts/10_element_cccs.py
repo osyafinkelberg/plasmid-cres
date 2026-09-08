@@ -1,9 +1,9 @@
 from pathlib import Path
+
 import numpy as np
 import polars as pl
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
-
 
 # --- CONFIGURATION ---
 ADDGENE_DIR = Path().cwd().parent / "data/addgene"
@@ -130,7 +130,6 @@ if __name__ == "__main__":
         is_cryptic_cre=(
             (~pl.col("type").is_in(["promoter", "enhancer"])) &
             (pl.col("element_length") >= CRE_LENGTH_THRESH) &
-            ((pl.col("n_citations") >= N_CITATIONS_FILTER) | (pl.col("n_citations").is_null())) &
             (pl.col("priority_group") <= N_CLUSTERS - 1)
         )
     )

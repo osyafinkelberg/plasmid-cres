@@ -11,12 +11,63 @@ from .helpers import extract_feature_name
 from .statplots import GENOMIC_COLORS
 
 
+def stap_peak_intervals(counts: np.ndarray, n_top: int, merge_gap: int = 5) -> list[list[int]]:
+    """Top-n initiation sites as [[start, end], ...] array-index intervals.
+
+    Adjacent sites within `merge_gap` bp are merged, so a cluster of initiation
+    events reads as one peak rather than a picket fence.
+    """
+    idx = np.argsort(counts)[::-1][:n_top]
+    idx = np.sort(idx[counts[idx] > 0])
+    if idx.size == 0:
+        return []
+    intervals, start, prev = [], idx[0], idx[0]
+    for i in idx[1:]:
+        if i - prev <= merge_gap:
+            prev = i
+        else:
+            intervals.append([int(start), int(prev) + 1])
+            start = prev = i
+    intervals.append([int(start), int(prev) + 1])
+    return intervals
+
+
 def get_polar_angle(position, seq_length):
     # top-start and clockwise rotation
     return 2 * np.pi * (position / seq_length)
 
 
-def plot_backbone(gb_file: Path) -> plt.Axes:
+def plot_backbone(
+    gb_file: Path,
+    ax: plt.Axes | None = None,
+    element_legend: bool = True,
+    label_scale: float = 1.0,
+) -> plt.Axes:
+    """Draw a circular plasmid map from a GenBank record.
+
+    Parameters
+    ----------
+    gb_file : Path
+        GenBank record to draw. Must carry a ``Sequence Label:`` comment.
+    ax : plt.Axes, optional
+        Existing **polar** axes to draw into. When omitted a new 10x10 figure is
+        created, which is the original behaviour. Pass axes made with
+        ``subplot_kw={"projection": "polar"}`` to place several plasmids in one
+        figure.
+    element_legend : bool
+        Draw the "Plasmid Elements" legend on these axes. Set False when several
+        panels share a single legend; the patch handles remain available as
+        ``ax.plasmid_element_handles`` so the caller can build one.
+    label_scale : float
+        Multiplier for the feature-label and centre-label font sizes. Useful
+        when the axes is smaller than the default standalone figure.
+
+    Returns
+    -------
+    plt.Axes
+        The axes drawn into, with ``.plasmid_element_handles`` set to the list
+        of legend patches for the features present in this record.
+    """
     record = SeqIO.read(gb_file, "genbank")
     comments = record.annotations.get("comment", "")
     match = re.search(r"Sequence Label:\s*(.*)", comments)
@@ -25,7 +76,13 @@ def plot_backbone(gb_file: Path) -> plt.Axes:
 
     seq_len = len(record.seq)
 
-    _, ax = plt.subplots(figsize=(10, 10), subplot_kw={'projection': 'polar'})
+    if ax is None:
+        _, ax = plt.subplots(figsize=(10, 10), subplot_kw={'projection': 'polar'})
+    elif ax.name != "polar":
+        raise ValueError(
+            "plot_backbone needs polar axes; create them with "
+            'subplot_kw={"projection": "polar"}'
+        )
     ax.set_theta_direction(-1)  # clockwise
     ax.set_theta_offset(np.pi / 2)  # 0 at the top
     ax.axis('off')  # hide standard polar grid
@@ -119,23 +176,29 @@ def plot_backbone(gb_file: Path) -> plt.Axes:
                 center_theta, text_r, name, 
                 ha='center', va='center', 
                 rotation=rot_deg, 
-                fontsize=9, fontweight='bold', zorder=4
+                fontsize=9 * label_scale, fontweight='bold', zorder=4
             )
 
         if any(p.get_label() == name for p in legend_patches):
             continue
         legend_patches.append(mpatches.Patch(color=color, label=name))
 
-    backbone_legend = ax.legend(
-        handles=legend_patches, 
-        loc='upper left', 
-        bbox_to_anchor=(0, 1.05), 
-        title="Plasmid Elements", 
-        frameon=False,
-        prop={'size': 9}
+    ax.plasmid_element_handles = legend_patches
+
+    if element_legend:
+        backbone_legend = ax.legend(
+            handles=legend_patches, 
+            loc='upper left', 
+            bbox_to_anchor=(0, 1.05), 
+            title="Plasmid Elements", 
+            frameon=False,
+            prop={'size': 9}
+        )
+        ax.add_artist(backbone_legend) 
+    ax.text(
+        0, 0, f"{seq_label}\n{seq_len} bp",
+        ha='center', va='center', fontsize=12 * label_scale, fontweight='bold',
     )
-    ax.add_artist(backbone_legend) 
-    ax.text(0, 0, f"{seq_label}\n{seq_len} bp", ha='center', va='center', fontsize=12, fontweight='bold')
 
     return ax
 
@@ -329,6 +392,83 @@ def plot_peak_annotation(
                 color=color, alpha=min(alpha + 0.15, 1.0),
                 lw=line_width, solid_capstyle="butt", zorder=6,
             )
+
+
+def window_mask(start: int, end: int, seq_len: int) -> np.ndarray:
+    """Boolean mask for a 1-based inclusive window that may wrap the origin."""
+    m = np.zeros(seq_len, dtype=bool)
+    s, e = start - 1, end - 1
+    if s <= e:
+        m[s : e + 1] = True
+    else:
+        m[s:] = True
+        m[: e + 1] = True
+    return m
+
+
+def blank_masked(track: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """NaN out masked positions - pcolormesh draws NaN cells transparent."""
+    out = np.asarray(track, dtype=float).copy()
+    out[mask] = np.nan
+    return out
+
+
+def keep_unmasked_peaks(peaks, mask: np.ndarray) -> list[list[int]]:
+    """Drop predicted peaks lying entirely inside the masked window.
+
+    Otherwise their annotation arcs are drawn across the blanked wedge. Every
+    one of the five vectors has a CREST CRE call inside the stuffer - the CmR
+    resistance gene scores as a regulatory element - which is an artefact of
+    predicting on DNA the assay never saw. Peaks straddling the boundary are
+    kept: the part outside the window is genuinely comparable.
+    """
+    # polars .to_list() on a one-row frame nests one level: [[[s, e], ...]],
+    # and an empty column comes back as [[]] rather than [].
+    if peaks and isinstance(peaks[0], list) and (not peaks[0] or isinstance(peaks[0][0], list)):
+        peaks = peaks[0]
+    n = len(mask)
+    out = []
+    for iv in peaks or []:
+        if len(iv) < 2:
+            continue
+        a, b = int(iv[0]), int(iv[1])
+        idx = np.arange(a, b + 1) if a <= b else np.r_[np.arange(a, n), np.arange(0, b + 1)]
+        if not mask[idx % n].all():
+            out.append(iv)
+    return out
+
+
+def shade_masked(ax, window, seq_len, r_inner, r_outer, color="0.85") -> None:
+    """Grey wedge behind the transparent gap left by the masked positions."""
+    s, e = window[0] - 1, window[1] - 1
+    spans = [(s, e)] if s <= e else [(s, seq_len - 1), (0, e)]
+    for a, b in spans:
+        theta = get_polar_angle(np.linspace(a, b + 1, 200), seq_len)
+        ax.fill_between(theta, r_inner, r_outer, color=color, alpha=0.9, lw=0, zorder=0.5)
+
+
+def rotate_masked_window_to_bottom(ax: plt.Axes, window: tuple[int, int], seq_len: int) -> None:
+    """Spin the panel so the masked window is centred at the bottom of the circle.
+
+    Only the axes' theta offset changes, so every track, annotation and feature
+    moves together and no coordinates are touched. `plot_backbone` computes its
+    feature-label rotations assuming the default offset of pi/2, so they are
+    recomputed here from each label's own angle.
+    """
+    start = window[0] - 1
+    span = (window[1] - window[0]) % seq_len + 1
+    centre = (start + span / 2) % seq_len
+    offset = get_polar_angle(centre, seq_len) - np.pi / 2
+    ax.set_theta_offset(offset)
+
+    for txt in ax.texts:
+        theta, radius = txt.get_position()
+        if radius <= 0.5:          # the centred plasmid name stays upright
+            continue
+        rot = (np.degrees(offset - theta) - 90.0 + 180.0) % 360.0 - 180.0
+        if rot < -90 or rot > 90:
+            rot += 180
+        txt.set_rotation(rot)
 
 
 def plot_track_linear(

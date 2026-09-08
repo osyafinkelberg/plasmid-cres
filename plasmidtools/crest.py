@@ -1,14 +1,13 @@
 import sys
 from pathlib import Path
 from typing import override
+
 import numpy as np
 import torch
 from torch import nn
 
-
 sys.path.insert(0, "/projectnb/vtrs/joseff/mpra-predictor")
 import mpra_predictor
-
 
 VALID_BASES = {'A', 'C', 'G', 'T'}
 BATCH_SIZE = 100
@@ -27,7 +26,7 @@ CREST_LABELS = np.array([col.removesuffix("_mean") for col in PARAM_CONFIG["targ
 CREST_DIR = Path("/projectnb/vtrs/joseff/mpra-predictor")
 
 
-class PredictorBase():
+class PredictorBase:
     def __init__(self, model: nn.Module, BATCH_SIZE: int, needs_validation: bool = True):
         self.model = model.to(DEVICE).eval()
         self.BATCH_SIZE = BATCH_SIZE
@@ -40,9 +39,7 @@ class PredictorBase():
     def validate_tile_sequence(tile_sequence: str) -> bool:
         if len(tile_sequence) != 200:
             return False
-        if len(set(tile_sequence) - VALID_BASES) != 0:
-            return False
-        return True
+        return len(set(tile_sequence) - VALID_BASES) == 0
 
     def update(self, tile_id: str, tile_sequence: str) -> None:
         if self.needs_validation and not self.validate_tile_sequence(tile_sequence):
@@ -87,10 +84,10 @@ class CRESTInterpreter:
     def __init__(self, batch_size: int, pred_index: int = 4):
         # NOTE: by default pred_idx = 4, which corresponds to HEK293T MPRA prediction
         self.batch_size = batch_size
-        self.batch_sequences = list()
-        self.valid_ids = list()
-        self.onehots = list()
-        self.contribs = list()
+        self.batch_sequences = []
+        self.valid_ids = []
+        self.onehots = []
+        self.contribs = []
 
         self.sei_flank_builder = mpra_predictor.dataloader.prepare_flank_builder(input_size=4096)
         self.mal_flank_builder = mpra_predictor.dataloader.prepare_flank_builder(input_size=600)
@@ -111,10 +108,8 @@ class CRESTInterpreter:
     def validate_tile_sequence(tile_sequence: str) -> bool:
         if len(tile_sequence) != 200:
             return False
-        if len(set(tile_sequence) - VALID_BASES) != 0:  # invalid sequence
-            return False
-        return True
-
+        return len(set(tile_sequence) - VALID_BASES) == 0
+ 
     def batch_infer(self, batch_sequences: list[str]) -> np.ndarray:
         onehots = [mpra_predictor.dataloader.dna_to_tensor(seq) for seq in batch_sequences]
         self.onehots.append(onehots)

@@ -1,10 +1,10 @@
 from pathlib import Path
+
 import numpy as np
 import polars as pl
 from Bio import SeqIO
 from Bio.Seq import Seq
 from tqdm import tqdm
-
 
 # --- CONFIGURATION ---
 CUR_DIR = Path(__file__).resolve()
@@ -271,7 +271,7 @@ def collect_primer_data() -> None:
                 else:
                     # handle circular wrap-around intervals
                     idx_set.update(range(s, L))
-                    idx_set.update(range(0, e))
+                    idx_set.update(range(e))
 
             mapped_elements.append({
                 "type": elem["element_type"],
@@ -295,7 +295,7 @@ def collect_primer_data() -> None:
                         primer_idx.update(range(s, e))
                     else:
                         primer_idx.update(range(s, L))
-                        primer_idx.update(range(0, e))
+                        primer_idx.update(range(e))
 
                 # check for absolute containment within other features
                 overlap_type = ""
@@ -464,5 +464,3 @@ if __name__ == "__main__":
     # # 4.
     calculate_element_citation_statistics(ELEMENT_POSITIONS_OUT, ELEMENT_CITATIONS_OUT)
     calculate_element_citation_statistics(PRIMERS_POSITIONS_OUT, PRIMERS_CITATIONS_OUT)
-
-    pass

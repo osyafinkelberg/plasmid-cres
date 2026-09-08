@@ -1,12 +1,12 @@
 import sys
 from pathlib import Path
+
 import numpy as np
 import polars as pl
 from tqdm import tqdm
 
 sys.path.insert(0, "..")
 from plasmidtools import crest, pileups
-
 
 # --- CONFIGURATION ---
 DATA_DIR = Path().cwd().parent / "data"

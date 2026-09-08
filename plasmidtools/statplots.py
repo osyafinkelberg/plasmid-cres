@@ -1,15 +1,14 @@
+import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-import matplotlib.patches as mpatches
-from matplotlib.colors import ListedColormap
-from matplotlib.lines import Line2D
 import seaborn as sns
 from adjustText import adjust_text
+from matplotlib import gridspec
+from matplotlib.colors import ListedColormap
+from matplotlib.lines import Line2D
+from scipy.cluster.hierarchy import fcluster, leaves_list, linkage
 from scipy.spatial.distance import pdist
-from scipy.cluster.hierarchy import linkage, leaves_list, fcluster
-
 
 ELEMENT_TYPE_PRIORITIES = {
     "CDS": 29, "promoter": 28, "rep_origin": 27, "oriT": 26,
@@ -160,7 +159,7 @@ def plot_regulatory_correlation(
     adjust_text(
         texts,
         ax=ax,
-        arrowprops=dict(arrowstyle="-", color="#64748b", lw=0.6, alpha=0.7),
+        arrowprops={"arrowstyle": "-", "color": "#64748b", "lw": 0.6, "alpha": 0.7},
         expand_points=(1.6, 1.6),
         force_points=(0.2, 0.4),
         zorder=4
@@ -224,6 +223,18 @@ def functional_profiling_plot(df_clustered: pl.DataFrame, heatmap_df: pl.DataFra
     row_colors = df_clustered['type'].map(lambda x: GENOMIC_COLORS.get(x, '#cccccc'))
     row_colors.name = "Type"
 
+    # Dynamically scale height when y-tick labels are shown so each row has
+    # enough vertical space for a legible font.  The overhead accounts for the
+    # column dendrogram, title, x-tick labels, and bottom whitespace.
+    LABEL_ROWS_THRESHOLD = 100
+    PER_ROW_HEIGHT  = 0.25   # inches per row — comfortable at fontsize 9–10
+    FIXED_OVERHEAD  = 3.5    # inches for non-heatmap chrome
+    show_ylabels    = len(df_clustered) <= LABEL_ROWS_THRESHOLD
+    fig_height      = (
+        max(9, len(df_clustered) * PER_ROW_HEIGHT + FIXED_OVERHEAD)
+        if show_ylabels else 9
+    )
+
     # Use clustermap but DISABLE row clustering so our strict sorting is preserved
     cg = sns.clustermap(
         heatmap_df,
@@ -234,7 +245,7 @@ def functional_profiling_plot(df_clustered: pl.DataFrame, heatmap_df: pl.DataFra
         vmin=-2.5,
         vmax=7.5,
         center=0,
-        figsize=(11, 9),
+        figsize=(11, fig_height),
         cbar_kws={'label': 'Relative Values\n(Z-Score)'},
         colors_ratio=0.03
     )
@@ -245,19 +256,35 @@ def functional_profiling_plot(df_clustered: pl.DataFrame, heatmap_df: pl.DataFra
 
     for i, priority in enumerate(df_clustered['priority_group']):
         if priority != current_priority:
-            # Draw a solid line when the priority group changes
             ax_heat.axhline(y=i, color='black', linewidth=1.5, linestyle='-')
             current_priority = priority
 
     # Formatting
     ax_heat.set_xticklabels(ax_heat.get_xticklabels(), rotation=45, ha='right', fontsize=10)
-    ax_heat.set_yticklabels([])
+
+    # --- Y-tick labels: show element IDs only when the plot isn't too crowded ---
+    if show_ylabels:
+        element_ids = [
+            f"{row['type']}, {row['name']}"
+            for _, row in df_clustered.iterrows()
+        ]
+        ax_heat.yaxis.set_ticks(np.arange(0.5, len(element_ids), 1))
+        ax_heat.set_yticklabels(
+            element_ids,
+            rotation=0,
+            fontsize=12,
+            fontweight='bold',
+            va='center',
+        )
+    else:
+        ax_heat.set_yticklabels([])
+
     ax_heat.set_ylabel(f"N = {len(df_clustered)}", fontsize=12, fontweight='bold')
     cg.ax_col_dendrogram.set_title("Functional Profiling of Plasmid Elements", fontsize=14, fontweight='bold', pad=20)
 
     # Add Element Type Legend
     legend_patches = [
-        mpatches.Patch(color=color, label=el_type) 
+        mpatches.Patch(color=color, label=el_type)
         for el_type, color in GENOMIC_COLORS.items() if el_type in df_clustered['type'].unique()
     ]
     cg.ax_row_dendrogram.legend(

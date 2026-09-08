@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+
 import h5py
 import numpy as np
 import polars as pl
@@ -7,7 +8,6 @@ from tqdm import tqdm
 
 sys.path.insert(0, "..")
 from plasmidtools import helpers
-
 
 # --- CONFIGURATION ---
 ADDGENE_DIR = Path().cwd().parent / "data/addgene"
@@ -54,7 +54,7 @@ def get_interval_indices(intervals: list, L: int) -> np.ndarray:
             indices.extend(range(s, e))
         else:  # Wrap around origin
             indices.extend(range(s, L))
-            indices.extend(range(0, e))
+            indices.extend(range(e))
 
     return np.unique(np.array(indices) % L)
 
@@ -155,7 +155,7 @@ def calculate_overlap_statistics(elements_path: Path, output_path: Path) -> None
                     body_indices.extend(range(s, e))
                 else:
                     body_indices.extend(range(s, L))
-                    body_indices.extend(range(0, e))
+                    body_indices.extend(range(e))
 
             body_idx = np.array(body_indices) % L
 
