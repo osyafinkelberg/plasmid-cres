@@ -15,6 +15,31 @@ from scipy.spatial.distance import pdist
 # one; TSS metrics are cell-agnostic and keep their plain names.
 DEFAULT_CRE_CELL = "HEK293T"
 
+# Figures are read from slides and printed panels, not zoomed in a notebook, so
+# every text element is sized up front. Tune a figure's type here rather than by
+# hunting down scattered `fontsize=` arguments.
+FONT_SIZES = {
+    "title": 22,
+    "axis_label": 18,
+    "tick": 17,
+    "legend": 16,
+    "legend_title": 17,
+    "row_label": 13,     # per-element ids, one per heatmap row
+    "group_label": 15,   # priority-block labels, one per block
+    "cbar_tick": 14,
+}
+
+# `functional_profiling_plot` sizing. Height follows the row count and width the
+# metric count, so the same call renders a 60-row and a 600-row view legibly.
+LABEL_ROWS_THRESHOLD = 100    # above this, rows get block labels instead of ids
+PER_ROW_HEIGHT = 0.25         # inches per labelled row - room for its text
+DENSE_ROW_HEIGHT = 0.024      # inches per unlabelled row - a visible band
+HEIGHT_OVERHEAD = 4.0         # inches of non-heatmap chrome
+MAX_FIG_HEIGHT = 32
+PER_METRIC_WIDTH = 1.1        # inches per heatmap column
+WIDTH_OVERHEAD = 5.5          # inches for row colors, legend strip and margins
+MAX_FIG_WIDTH = 24
+
 ELEMENT_TYPE_PRIORITIES = {
     "CDS": 29, "promoter": 28, "rep_origin": 27, "oriT": 26,
     "RBS": 25, "terminator": 24, "polyA_signal": 23, "enhancer": 22, "regulatory": 21,
@@ -224,63 +249,77 @@ def plot_regulatory_correlation(
     return fig, ax
 
 
-def functional_profiling_plot(df_clustered: pl.DataFrame, heatmap_df: pl.DataFrame) -> sns.matrix.ClusterGrid:
+def functional_profiling_plot(
+    df_clustered: pl.DataFrame,
+    heatmap_df: pl.DataFrame,
+    title: str | None = None,
+    show_ylabels: bool | None = None,
+) -> sns.matrix.ClusterGrid:
+    """Ordered heatmap of the functional-profile clustering.
+
+    The figure sizes itself from the data, so a 60-row cryptic-CRE view and a
+    600-row full view are both legible from the same call. Neither axis is
+    clustered here: rows keep the priority ranking they were sorted into and
+    columns keep their metric-major order, which already places the same metric
+    for different cell lines side by side.
+
+    Parameters
+    ----------
+    title : str, optional
+        Names the subset being shown; appended to the standing heading.
+    show_ylabels : bool, optional
+        Force per-element row labels on or off. By default they appear only when
+        there are few enough rows to read them; otherwise each priority block
+        gets a single label, which is the only structure legible at that density.
+    """
     df_clustered, heatmap_df = df_clustered.to_pandas(), heatmap_df.to_pandas()
+    n_rows = len(df_clustered)
 
     # --- 1. Render the Ordered Heatmap ---
-    sns.set_theme(style="white", context="paper", font_scale=1.1)
+    sns.set_theme(style="white", context="paper", font_scale=1.4)
 
     # Map row colors
     row_colors = df_clustered['type'].map(lambda x: GENOMIC_COLORS.get(x, '#cccccc'))
     row_colors.name = "Type"
 
-    # Dynamically scale height when y-tick labels are shown so each row has
-    # enough vertical space for a legible font.  The overhead accounts for the
-    # column dendrogram, title, x-tick labels, and bottom whitespace.
-    LABEL_ROWS_THRESHOLD = 100
-    PER_ROW_HEIGHT  = 0.25   # inches per row — comfortable at fontsize 9–10
-    FIXED_OVERHEAD  = 3.5    # inches for non-heatmap chrome
-    show_ylabels    = len(df_clustered) <= LABEL_ROWS_THRESHOLD
-    fig_height      = (
-        max(9, len(df_clustered) * PER_ROW_HEIGHT + FIXED_OVERHEAD)
-        if show_ylabels else 9
-    )
+    # Height follows the row count in both regimes. Labelled rows need room for
+    # their text; unlabelled rows only need to stay a visible band, but they do
+    # need height - a fixed figure crushes several hundred rows into nothing.
+    if show_ylabels is None:
+        show_ylabels = n_rows <= LABEL_ROWS_THRESHOLD
+    row_height = PER_ROW_HEIGHT if show_ylabels else DENSE_ROW_HEIGHT
+    fig_height = min(MAX_FIG_HEIGHT, max(9, n_rows * row_height + HEIGHT_OVERHEAD))
+    fig_width = min(MAX_FIG_WIDTH, max(11, heatmap_df.shape[1] * PER_METRIC_WIDTH + WIDTH_OVERHEAD))
 
-    # Width follows the metric count: clustering on several cell lines multiplies
-    # the columns, and the rotated x-labels collide at the old fixed 11 inches.
-    # The formula reproduces that 11 exactly for the five-metric single-cell case.
-    PER_METRIC_WIDTH = 1.1   # inches per heatmap column
-    WIDTH_OVERHEAD   = 5.5   # inches for row colors, dendrogram and margins
-    fig_width        = min(24, max(11, heatmap_df.shape[1] * PER_METRIC_WIDTH + WIDTH_OVERHEAD))
-
-    # Use clustermap but DISABLE row clustering so our strict sorting is preserved
+    # Clustering is disabled on both axes, so no dendrogram is drawn. The column
+    # strip is kept just deep enough to carry the heading; the row strip holds
+    # the element-type legend.
     cg = sns.clustermap(
         heatmap_df,
         row_cluster=False,       # KEEP rows sorted by our Priority ranking
-        col_cluster=True,        # Let metrics group if they behave similarly
+        col_cluster=False,       # KEEP metric-major column order from the caller
         row_colors=row_colors,
         cmap="RdBu_r",
         vmin=-2.5,
         vmax=7.5,
         center=0,
         figsize=(fig_width, fig_height),
+        dendrogram_ratio=(0.20, 0.06),
         cbar_kws={'label': 'Relative Values\n(Z-Score)'},
         colors_ratio=0.03
     )
 
     # Draw separators between Priority Groups
     ax_heat = cg.ax_heatmap
-    current_priority = df_clustered['priority_group'].iloc[0]
-
-    for i, priority in enumerate(df_clustered['priority_group']):
-        if priority != current_priority:
-            ax_heat.axhline(y=i, color='black', linewidth=1.5, linestyle='-')
-            current_priority = priority
+    groups = df_clustered['priority_group'].to_numpy()
+    bounds = [0] + [i for i in range(1, n_rows) if groups[i] != groups[i - 1]] + [n_rows]
+    for boundary in bounds[1:-1]:
+        ax_heat.axhline(y=boundary, color='black', linewidth=1.8)
 
     # Formatting
-    ax_heat.set_xticklabels(ax_heat.get_xticklabels(), rotation=45, ha='right', fontsize=17)
+    ax_heat.set_xticklabels(ax_heat.get_xticklabels(), rotation=45, ha='right', fontsize=FONT_SIZES["tick"])
 
-    # --- Y-tick labels: show element IDs only when the plot isn't too crowded ---
+    # --- Y-tick labels: element IDs when they fit, priority blocks otherwise ---
     if show_ylabels:
         element_ids = [
             f"{row['type']}, {row['name']}"
@@ -290,15 +329,27 @@ def functional_profiling_plot(df_clustered: pl.DataFrame, heatmap_df: pl.DataFra
         ax_heat.set_yticklabels(
             element_ids,
             rotation=0,
-            fontsize=12,
+            fontsize=FONT_SIZES["row_label"],
             fontweight='bold',
             va='center',
         )
     else:
-        ax_heat.set_yticklabels([])
+        ax_heat.yaxis.set_ticks([(a + b) / 2 for a, b in zip(bounds[:-1], bounds[1:])])
+        ax_heat.set_yticklabels(
+            [f"P{groups[a]} - n={b - a}" for a, b in zip(bounds[:-1], bounds[1:])],
+            rotation=0,
+            fontsize=FONT_SIZES["group_label"],
+            fontweight='bold',
+            va='center',
+        )
 
-    ax_heat.set_ylabel(f"N = {len(df_clustered)}", fontsize=12, fontweight='bold')
-    cg.ax_col_dendrogram.set_title("Functional Profiling of Plasmid Elements", fontsize=14, fontweight='bold', pad=20)
+    ax_heat.set_ylabel(f"N = {n_rows}", fontsize=FONT_SIZES["axis_label"], fontweight='bold')
+
+    heading = "Functional Profiling of Plasmid Elements"
+    cg.ax_col_dendrogram.set_title(
+        f"{heading} - {title}" if title else heading,
+        fontsize=FONT_SIZES["title"], fontweight='bold', pad=20,
+    )
 
     # Add Element Type Legend
     legend_patches = [
@@ -306,10 +357,14 @@ def functional_profiling_plot(df_clustered: pl.DataFrame, heatmap_df: pl.DataFra
         for el_type, color in GENOMIC_COLORS.items() if el_type in df_clustered['type'].unique()
     ]
     cg.ax_row_dendrogram.legend(
-        handles=legend_patches, title="Element Type", title_fontproperties={'weight': 'bold'},
+        handles=legend_patches, title="Element Type",
+        title_fontproperties={'weight': 'bold', 'size': FONT_SIZES["legend_title"]},
+        fontsize=FONT_SIZES["legend"],
         loc="lower left", bbox_to_anchor=(-0.4, -0.2), frameon=False
     )
     cg.ax_cbar.set_position([0.02, 0.8, 0.03, 0.15])
+    cg.ax_cbar.set_ylabel('Relative Values\n(Z-Score)', fontsize=FONT_SIZES["legend"])
+    cg.ax_cbar.tick_params(labelsize=FONT_SIZES["cbar_tick"])
     return cg
 
 
