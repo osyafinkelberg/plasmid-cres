@@ -9,19 +9,90 @@ from sklearn.preprocessing import StandardScaler
 ADDGENE_DIR = Path().cwd().parent / "data/addgene"
 ELEMENT_OVERLAPS = ADDGENE_DIR / "mammalian_plasmids_element_cre_overlaps.parquet"
 ELEMENT_CITATIONS = ADDGENE_DIR / "citations_addgene_elements.parquet"
+CREST_THRESHOLDS = Path().cwd().parent / "../mpra-predictor/data/cre_thresholds_fdr_001.csv"
 
 OUT_CLUSTER_RAW = ADDGENE_DIR / "element_cre_overlap_clustering.csv"
 OUT_CLUSTER_RAW_HEAT = ADDGENE_DIR / "element_cre_overlap_clustering_heatmap.csv"
 
 ID_COLUMNS = ["type", "name", "element_length"]
-METRIC_COLUMNS = ["n_cre_midpoints", "cre_avg_signal", "fraction_cre_bp", "n_tss_midpoints", "tss_avg_signal"]
 POPULARITY_COLUMNS = ["n_plasmids", "n_citations"]
 
-METRIC_LABELS = ["# CRE Midpoints per Feature Instance", "Average activity of CRE base pairs", "Fraction base pairs that are CRE", "# TSS Midpoints per Feature Instance", "Average activity of TSS base pairs"]
-METRIC_THRESH = [0.25, 2, 0.1, 0.25, 0.1]
-N_CITATIONS_FILTER = 50
+# --- METRIC REGISTRY ---
+# `cre_avg_signal` deliberately carries no fixed threshold. CREST activity scales
+# differ by ~2.2x between cell lines (GM12878 1.05 vs SHSY5Y 2.35 at FDR 0.01),
+# so one shared constant would be far too strict for the former and too lenient
+# for the latter. It is instead derived per cell line as the strict CRE-calling
+# threshold used in `07_cre_annotation.py`
+PER_CELL_THRESHOLD = None
+
+CRE_METRIC_SPECS = {
+    "n_cre_midpoints": ("# CRE Midpoints per Feature Instance", 0.25),
+    "cre_avg_signal": ("Average activity of CRE base pairs", PER_CELL_THRESHOLD),
+    "fraction_cre_bp": ("Fraction base pairs that are CRE", 0.1),
+}
+TSS_METRIC_SPECS = {
+    "n_tss_midpoints": ("# TSS Midpoints per Feature Instance", 0.25),
+    "tss_avg_signal": ("Average activity of TSS base pairs", 0.1),
+}
+
+CRE_SIGNAL_THRESH_SCALE = 1.15  # strict thresholding, as in 07_cre_annotation.py
+CRE_SIGNAL_THRESH = {
+    row["cell"]: row["threshold"] * CRE_SIGNAL_THRESH_SCALE
+    for row in pl.read_csv(CREST_THRESHOLDS).iter_rows(named=True)
+}
+
+# --- CLUSTERING ---
+# Every metric above is computed for every cell line and written to OUT_CLUSTER_RAW.
+# Only the columns listed here shape the clusters and the heatmap
+
+# CLUSTERING_CELLS = ["GM12878", "Jurkat", "MRC5", "A549", "HEK293T", "K562", "SHSY5Y", "SiHa"]
+CLUSTERING_CELLS = ["GM12878", "MRC5", "A549", "HEK293T", "K562", "SHSY5Y"]
+
+METRIC_COLUMNS = (
+    [f"{metric} ({cell})" for cell in CLUSTERING_CELLS for metric in CRE_METRIC_SPECS]
+    + list(TSS_METRIC_SPECS)
+)
+
 N_CLUSTERS = 7
 CRE_LENGTH_THRESH = 100
+
+
+def split_metric(column: str) -> tuple[str, str | None]:
+    """Split a `<metric> (<cell>)` column into its base metric and cell line."""
+    base, separator, cell = column.partition(" (")
+    return (base, cell[:-1]) if separator else (base, None)
+
+
+def metric_label(column: str) -> str:
+    """Heatmap column label for a metric column, cell-line suffix and all."""
+    base, cell = split_metric(column)
+    if base in TSS_METRIC_SPECS:
+        return TSS_METRIC_SPECS[base][0]
+    return f"{CRE_METRIC_SPECS[base][0]} [{cell}]"
+
+
+def metric_threshold(column: str) -> float:
+    """Physical activity threshold a metric column must clear to count as active."""
+    base, cell = split_metric(column)
+    if base in TSS_METRIC_SPECS:
+        return TSS_METRIC_SPECS[base][1]
+    threshold = CRE_METRIC_SPECS[base][1]
+    if threshold is not PER_CELL_THRESHOLD:
+        return threshold
+    if cell is None:
+        raise ValueError(f"'{column}' needs a cell line to resolve its threshold")
+    return CRE_SIGNAL_THRESH[cell]
+
+
+def available_metric_columns(columns) -> list[str]:
+    """Every metric the overlaps table supports, CRE metrics once per cell line."""
+    prefix = "cre_avg_signal ("
+    cells = [column[len(prefix):-1] for column in columns if column.startswith(prefix)]
+    return [f"{metric} ({cell})" for cell in cells for metric in CRE_METRIC_SPECS] + list(TSS_METRIC_SPECS)
+
+
+METRIC_LABELS = [metric_label(column) for column in METRIC_COLUMNS]
+METRIC_THRESH = [metric_threshold(column) for column in METRIC_COLUMNS]
 
 
 def functional_profile_clustering(
@@ -116,11 +187,22 @@ if __name__ == "__main__":
     )
 
     # 1. Clustering
+    # Every available metric is kept in the frame so the written table carries all
+    # cell lines; METRIC_COLUMNS alone decides what the clustering actually sees.
+    ALL_METRIC_COLUMNS = available_metric_columns(element_cre_overlap.columns)
+    missing = [column for column in METRIC_COLUMNS if column not in ALL_METRIC_COLUMNS]
+    if missing:
+        raise KeyError(f"METRIC_COLUMNS absent from {ELEMENT_OVERLAPS.name}: {missing}")
+
+    print(f"Writing {len(ALL_METRIC_COLUMNS)} metrics, clustering on {len(METRIC_COLUMNS)}:")
+    for column in METRIC_COLUMNS:
+        print(f"  {column:44s} threshold {metric_threshold(column):.5f}")
+
     df = (
         element_cre_overlap
         .filter(pl.col("element_length") >= CRE_LENGTH_THRESH)
-        [ID_COLUMNS + METRIC_COLUMNS + POPULARITY_COLUMNS]
-        .with_columns(pl.col(col_name).fill_null(0) for col_name in METRIC_COLUMNS)
+        [ID_COLUMNS + ALL_METRIC_COLUMNS + POPULARITY_COLUMNS]
+        .with_columns(pl.col(col_name).fill_null(0) for col_name in ALL_METRIC_COLUMNS)
     )
     df_clustered, df_heatmap = functional_profile_clustering(df, METRIC_COLUMNS, METRIC_LABELS, METRIC_THRESH, N_CLUSTERS)
     df_heatmap.write_csv(OUT_CLUSTER_RAW_HEAT)

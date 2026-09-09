@@ -10,6 +10,11 @@ from matplotlib.lines import Line2D
 from scipy.cluster.hierarchy import fcluster, leaves_list, linkage
 from scipy.spatial.distance import pdist
 
+# `08_element_cre_overlap.py` emits CRE metrics once per CREST cell line, as
+# `<metric> (<cell>)`. This is the cell line assumed when a caller does not name
+# one; TSS metrics are cell-agnostic and keep their plain names.
+DEFAULT_CRE_CELL = "HEK293T"
+
 ELEMENT_TYPE_PRIORITIES = {
     "CDS": 29, "promoter": 28, "rep_origin": 27, "oriT": 26,
     "RBS": 25, "terminator": 24, "polyA_signal": 23, "enhancer": 22, "regulatory": 21,
@@ -59,7 +64,8 @@ GENOMIC_COLORS = {
 def plot_regulatory_correlation(
     df: pl.DataFrame,
     genomic_colors: dict = GENOMIC_COLORS,
-    x_col: str = "n_cre_midpoints",
+    cre_cell: str = DEFAULT_CRE_CELL,
+    x_col: str | None = None,
     y_col: str = "n_tss_midpoints",
     x_label: str = "# CRE Midpoints per Feature Instance",
     y_label: str = "# TSS Midpoints per Feature Instance",
@@ -73,7 +79,12 @@ def plot_regulatory_correlation(
     Plots a publication-quality scatter correlation between CRE and TSS metrics.
     Filters elements passing a threshold for at least one metric and handles label layout dynamically.
     Skips labels in high-density regions to reduce visual clutter.
+
+    `x_col` defaults to the CRE midpoint count for `cre_cell`; pass it explicitly
+    to plot any other metric, including another cell line's.
     """
+    if x_col is None:
+        x_col = f"n_cre_midpoints ({cre_cell})"
     # set publication theme
     sns.set_theme(style="ticks", context="paper")
     plt.rcParams.update({
@@ -235,6 +246,13 @@ def functional_profiling_plot(df_clustered: pl.DataFrame, heatmap_df: pl.DataFra
         if show_ylabels else 9
     )
 
+    # Width follows the metric count: clustering on several cell lines multiplies
+    # the columns, and the rotated x-labels collide at the old fixed 11 inches.
+    # The formula reproduces that 11 exactly for the five-metric single-cell case.
+    PER_METRIC_WIDTH = 1.1   # inches per heatmap column
+    WIDTH_OVERHEAD   = 5.5   # inches for row colors, dendrogram and margins
+    fig_width        = min(24, max(11, heatmap_df.shape[1] * PER_METRIC_WIDTH + WIDTH_OVERHEAD))
+
     # Use clustermap but DISABLE row clustering so our strict sorting is preserved
     cg = sns.clustermap(
         heatmap_df,
@@ -245,7 +263,7 @@ def functional_profiling_plot(df_clustered: pl.DataFrame, heatmap_df: pl.DataFra
         vmin=-2.5,
         vmax=7.5,
         center=0,
-        figsize=(11, fig_height),
+        figsize=(fig_width, fig_height),
         cbar_kws={'label': 'Relative Values\n(Z-Score)'},
         colors_ratio=0.03
     )
@@ -260,7 +278,7 @@ def functional_profiling_plot(df_clustered: pl.DataFrame, heatmap_df: pl.DataFra
             current_priority = priority
 
     # Formatting
-    ax_heat.set_xticklabels(ax_heat.get_xticklabels(), rotation=45, ha='right', fontsize=10)
+    ax_heat.set_xticklabels(ax_heat.get_xticklabels(), rotation=45, ha='right', fontsize=17)
 
     # --- Y-tick labels: show element IDs only when the plot isn't too crowded ---
     if show_ylabels:

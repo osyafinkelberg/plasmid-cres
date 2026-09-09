@@ -25,6 +25,17 @@ REPR_SEQ_OVERLAPS = ADDGENE_DIR / "element_representative_sequences_cre_overlaps
 TSS_FLANK_SIZE = 50
 
 
+def crest_cells(columns) -> list[str]:
+    """CREST cell-line names present as `CREST (<cell>)` columns, in file order."""
+    prefix = "CREST ("
+    return [col[len(prefix):-1] for col in columns if col.startswith(prefix)]
+
+
+def cre_column(metric: str, cell: str) -> str:
+    """Name of a per-cell-line CRE metric column."""
+    return f"{metric} ({cell})"
+
+
 def get_midpoints(intervals: list, plasmid_length: int) -> np.ndarray:
     """Calculates midpoints for a list of [start, end] intervals, handling origin wraps."""
     if not intervals:
@@ -77,36 +88,55 @@ def calculate_overlap_statistics(elements_path: Path, output_path: Path) -> None
     cre_tss_df = pl.read_parquet(CRE_TSS_FILE)
     stats_df = pl.read_parquet(STATS_FILE)
 
-    # Pre-load CREST global arrays to allow avg_signal extraction
+    cells = crest_cells(cre_tss_df.columns)
+    print(f"CRE statistics for {len(cells)} CREST cell line(s): {', '.join(cells)}")
+
+    # Pre-load CREST global arrays to allow avg_signal extraction, one row per cell line.
     tile_encoding = pl.read_parquet(CREST_TILE_ENCOD)
     cre_predictions = pl.read_parquet(CREST_TILE_PREDS)
     n_crest_tiles = tile_encoding["tile_ids"].list.max().max() + 1
-    hek293t_tile_preds = np.full(n_crest_tiles, np.nan)
-    hek293t_tile_preds[cre_predictions["tile_ID"].to_numpy()] = cre_predictions["HEK293T"].to_numpy()
+    pred_tile_ids = cre_predictions["tile_ID"].to_numpy()
+    crest_tile_preds = np.full((len(cells), n_crest_tiles), np.nan)
+    for cell_idx, cell in enumerate(cells):
+        crest_tile_preds[cell_idx, pred_tile_ids] = cre_predictions[cell].to_numpy()
 
-    # optimization: pre-map crest tiles to dictionaries for O(1) lookup
-    crest_tiles_dict = dict(zip(tile_encoding["gbk_name"].to_list(), tile_encoding["tile_ids"].to_list()))
+    # optimization: flat int32 tile-id array plus per-plasmid offsets. Holding
+    # the same 442M ids as Python lists costs ~15 GB; this costs ~1.8 GB.
+    tile_ids_flat = tile_encoding["tile_ids"].explode().to_numpy().astype(np.int32)
+    tile_offsets = np.concatenate(([0], np.cumsum(tile_encoding["tile_ids"].list.len().to_numpy().astype(np.int64))))
+    crest_tile_span = {
+        gbk_name: (int(tile_offsets[i]), int(tile_offsets[i + 1]))
+        for i, gbk_name in enumerate(tile_encoding["gbk_name"].to_list())
+    }
 
-    # 2. Pre-calculate midpoints AND full interval indices
-    seq_data = {}
-    for row in stats_df.iter_rows(named=True):
-        seq_data[row["sequence_id"]] = {"L": row["plasmid_length"]}
-
+    # 2. Plasmid-level lookups.
+    # Only the raw interval lists are held for every plasmid (a few hundred bytes
+    # each). Expanding them into index sets is what costs memory - roughly 6 GB
+    # per cell line across the whole collection - so that is done one plasmid at
+    # a time in the loop below, which keeps peak memory flat as cell lines are
+    # added rather than growing 8-fold.
+    plasmid_length = dict(stats_df.select(["gbk_name", "plasmid_length"]).iter_rows())
+    cre_track_names = [f"CREST ({cell})" for cell in cells]
+    cre_intervals = {}
     for row in cre_tss_df.iter_rows(named=True):
-        seq_id = row["sequence_id"]
-        if seq_id not in seq_data:
-            continue
-        L = seq_data[seq_id]["L"]
+        cre_intervals[row["gbk_name"]] = (
+            [row[track] or [] for track in cre_track_names],
+            row["Puffin (FANTOM_CAGE_fwd)"] or [],
+            row["Puffin (FANTOM_CAGE_rev)"] or [],
+        )
 
-        # Calculate midpoints and immediately cast to fast Python lists of integers
-        seq_data[seq_id]["cre_mids_int"] = np.floor(get_midpoints(row["CREST (HEK293T)"], L)).astype(int).tolist()
-        seq_data[seq_id]["fwd_mids_int"] = np.floor(get_midpoints(row["Puffin (FANTOM_CAGE_fwd)"], L)).astype(int).tolist()
-        seq_data[seq_id]["rev_mids_int"] = np.floor(get_midpoints(row["Puffin (FANTOM_CAGE_rev)"], L)).astype(int).tolist()
-
-        # Calculate indices and immediately cast to Sets for O(1) intersection later
-        seq_data[seq_id]["cre_idx_set"] = set(get_interval_indices(row["CREST (HEK293T)"], L))
-        seq_data[seq_id]["fwd_idx_set"] = set(get_interval_indices(row["Puffin (FANTOM_CAGE_fwd)"], L))
-        seq_data[seq_id]["rev_idx_set"] = set(get_interval_indices(row["Puffin (FANTOM_CAGE_rev)"], L))
+    def empty_metrics() -> dict:
+        """Metric block for an element whose body maps to zero base pairs."""
+        record = {
+            "tss_hits": 0, "tss_fwd_hits": 0, "tss_rev_hits": 0,
+            "tss_fwd_avg_signal": np.nan, "tss_rev_avg_signal": np.nan,
+            "fraction_tss_fwd_bp": 0.0, "fraction_tss_rev_bp": 0.0,
+        }
+        for cell in cells:
+            record[cre_column("cre_hits", cell)] = 0
+            record[cre_column("cre_avg_signal", cell)] = np.nan
+            record[cre_column("fraction_cre_bp", cell)] = 0.0
+        return record
 
     # 3. Iterate through elements to count overlaps
     overlap_records = []
@@ -117,23 +147,50 @@ def calculate_overlap_statistics(elements_path: Path, output_path: Path) -> None
         puffin_fwd_idx = int(np.argwhere(puffin_feat_names == "FANTOM_CAGE fwd")[0, 0])
         puffin_rev_idx = int(np.argwhere(puffin_feat_names == "FANTOM_CAGE rev")[0, 0])
 
+        def plasmid_state(gbk_name: str) -> dict | None:
+            """Expand one plasmid's intervals into midpoints, index sets and signals."""
+            L = plasmid_length.get(gbk_name)
+            if L is None or gbk_name not in cre_intervals or gbk_name not in crest_tile_span:
+                return None
+
+            cre_iv, fwd_iv, rev_iv = cre_intervals[gbk_name]
+            span_start, span_end = crest_tile_span[gbk_name]
+            puffin_preds = h5f[gbk_name][:]
+
+            return {
+                "L": L,
+                "crest_signals": crest_tile_preds[:, tile_ids_flat[span_start:span_end]],
+                "puffin_fwd": puffin_preds[puffin_fwd_idx],
+                "puffin_rev": puffin_preds[puffin_rev_idx],
+                "cre_mids_int": [np.floor(get_midpoints(iv, L)).astype(int).tolist() for iv in cre_iv],
+                "cre_idx_set": [set(get_interval_indices(iv, L)) for iv in cre_iv],
+                "fwd_mids_int": np.floor(get_midpoints(fwd_iv, L)).astype(int).tolist(),
+                "rev_mids_int": np.floor(get_midpoints(rev_iv, L)).astype(int).tolist(),
+                "fwd_idx_set": set(get_interval_indices(fwd_iv, L)),
+                "rev_idx_set": set(get_interval_indices(rev_iv, L)),
+            }
+
         update_every = 25_000
         N_ELEMENT_INSTANCES = elements_df.height
         pbar = tqdm(total=N_ELEMENT_INSTANCES, desc="Mapping overlaps")
 
-        # optimization: Memory caches to prevent reading HDF5/Polars repeatedly
-        puffin_cache = {}
-        crest_cache = {}
+        # optimization: element rows are stored contiguously per plasmid, so a
+        # single-plasmid cache replaces the dictionaries that previously grew to
+        # hold every plasmid's Puffin and CREST tracks at once.
+        current_gbk, sd = None, None
 
         for row_idx, row in enumerate(elements_df.iter_rows(named=True)):
-            seq_id = row["sequence_id"]
-            if seq_id not in seq_data:
+            gbk_name = row["gbk_name"]
+            if gbk_name != current_gbk:
+                current_gbk, sd = gbk_name, plasmid_state(gbk_name)
+
+            if sd is None:
+                if (row_idx + 1) % update_every == 0 or row_idx == N_ELEMENT_INSTANCES - 1:
+                    pbar.update(update_every)
                 continue
 
-            sd = seq_data[seq_id]
             L = sd["L"]
             element_intervals = row["intervals"]
-            gbk_name = row["gbk_name"]
             strand = row["strand"]
             e_type = row["element_type"]
             e_name = row["element_name"]
@@ -161,12 +218,7 @@ def calculate_overlap_statistics(elements_path: Path, output_path: Path) -> None
 
             # log empty stats and skip the rest of the loop for this element
             if len(body_idx) == 0:
-                overlap_records.append({
-                    "type": out_type, "name": out_name,
-                    "cre_hits": 0, "tss_hits": 0, "tss_fwd_hits": 0, "tss_rev_hits": 0,
-                    "cre_avg_signal": np.nan, "tss_fwd_avg_signal": np.nan, "tss_rev_avg_signal": np.nan,
-                    "fraction_cre_bp": 0.0, "fraction_tss_fwd_bp": 0.0, "fraction_tss_rev_bp": 0.0
-                })
+                overlap_records.append({"type": out_type, "name": out_name, **empty_metrics()})
                 continue
 
             genomic_start = body_indices[0] % L
@@ -175,17 +227,8 @@ def calculate_overlap_statistics(elements_path: Path, output_path: Path) -> None
             genomic_left = np.arange(genomic_start - TSS_FLANK_SIZE, genomic_start) % L
             genomic_right = np.arange(genomic_end, genomic_end + TSS_FLANK_SIZE) % L
 
-            # --- Map Source Signals (Using Cache) ---
-            if gbk_name not in crest_cache:
-                crest_cache[gbk_name] = hek293t_tile_preds[np.array(crest_tiles_dict[gbk_name])]
-            plasmid_crest = crest_cache[gbk_name]
-
-            if gbk_name not in puffin_cache:
-                puffin_cache[gbk_name] = h5f[gbk_name][:]
-            puffin_preds = puffin_cache[gbk_name]
-   
-            puffin_fwd = puffin_preds[puffin_fwd_idx]
-            puffin_rev = puffin_preds[puffin_rev_idx]
+            puffin_fwd = sd["puffin_fwd"]
+            puffin_rev = sd["puffin_rev"]
 
             # --- Strand-aware Signal, Midpoint, and Index Resolution ---
             if strand == -1:
@@ -221,17 +264,14 @@ def calculate_overlap_statistics(elements_path: Path, output_path: Path) -> None
 
             # --- Calculate Counts (Based on midpoints) ---
             # Using generator sum avoids destroying duplicate midpoints while keeping O(1) set lookups
-            n_cre = sum(1 for m in sd["cre_mids_int"] if m in body_set)
             tss_fwd_hits = sum(1 for m in mids_fwd if m in fwd_set)
             tss_rev_hits = sum(1 for m in mids_rev if m in rev_set)
 
             # --- Calculate Averages & Fractions (Based on full interval intersections) ---
-            cre_overlap_idx = np.array(list(sd["cre_idx_set"] & body_set), dtype=int)
             tss_fwd_overlap_idx = np.array(list(full_fwd_set & fwd_set), dtype=int)
             tss_rev_overlap_idx = np.array(list(full_rev_set & rev_set), dtype=int)
 
             # Signal extraction 
-            cre_avg_signal = safe_nanmean(plasmid_crest, cre_overlap_idx)
             tss_fwd_avg_signal = safe_nanmean(signal_fwd, tss_fwd_overlap_idx)
             tss_rev_avg_signal = safe_nanmean(signal_rev, tss_rev_overlap_idx)
 
@@ -240,24 +280,29 @@ def calculate_overlap_statistics(elements_path: Path, output_path: Path) -> None
             len_fwd = len(fwd_set)
             len_rev = len(rev_set)
 
-            frac_cre = len(cre_overlap_idx) / len_body if len_body > 0 else 0.0
             frac_tss_fwd = len(tss_fwd_overlap_idx) / len_fwd if len_fwd > 0 else 0.0
             frac_tss_rev = len(tss_rev_overlap_idx) / len_rev if len_rev > 0 else 0.0
 
-            overlap_records.append({
+            record = {
                 "type": out_type,
                 "name": out_name,
-                "cre_hits": n_cre,
                 "tss_hits": tss_fwd_hits + tss_rev_hits,
                 "tss_fwd_hits": tss_fwd_hits,
                 "tss_rev_hits": tss_rev_hits,
-                "cre_avg_signal": cre_avg_signal,
                 "tss_fwd_avg_signal": tss_fwd_avg_signal,
                 "tss_rev_avg_signal": tss_rev_avg_signal,
-                "fraction_cre_bp": frac_cre,
                 "fraction_tss_fwd_bp": frac_tss_fwd,
-                "fraction_tss_rev_bp": frac_tss_rev
-            })
+                "fraction_tss_rev_bp": frac_tss_rev,
+            }
+
+            # --- Per-cell-line CRE overlap ---
+            for cell_idx, cell in enumerate(cells):
+                cre_overlap_idx = np.array(list(sd["cre_idx_set"][cell_idx] & body_set), dtype=int)
+                record[cre_column("cre_hits", cell)] = sum(1 for m in sd["cre_mids_int"][cell_idx] if m in body_set)
+                record[cre_column("cre_avg_signal", cell)] = safe_nanmean(sd["crest_signals"][cell_idx], cre_overlap_idx)
+                record[cre_column("fraction_cre_bp", cell)] = len(cre_overlap_idx) / len_body
+
+            overlap_records.append(record)
 
             if (row_idx + 1) % update_every == 0 or row_idx == N_ELEMENT_INSTANCES - 1:
                 pbar.update(update_every)
@@ -266,20 +311,25 @@ def calculate_overlap_statistics(elements_path: Path, output_path: Path) -> None
     # 4. Group by type & name, then average across all instances of that element
     if overlap_records:
         res_df = pl.DataFrame(overlap_records)
-        final_stats = res_df.group_by(["type", "name"]).agg([
-            pl.col("cre_hits").mean().alias("n_cre_midpoints"),
+        aggregations = [
             pl.col("tss_hits").mean().alias("n_tss_midpoints"),
             pl.col("tss_fwd_hits").mean().alias("n_tss_fwd_midpoints"),
             pl.col("tss_rev_hits").mean().alias("n_tss_rev_midpoints"),
 
-            pl.col("cre_avg_signal").drop_nans().mean().alias("cre_avg_signal"),
             pl.col("tss_fwd_avg_signal").drop_nans().mean().alias("tss_fwd_avg_signal"),
             pl.col("tss_rev_avg_signal").drop_nans().mean().alias("tss_rev_avg_signal"),
 
-            pl.col("fraction_cre_bp").mean().alias("fraction_cre_bp"),
             pl.col("fraction_tss_fwd_bp").mean().alias("fraction_tss_fwd_bp"),
             pl.col("fraction_tss_rev_bp").mean().alias("fraction_tss_rev_bp"),
-        ])
+        ]
+        for cell in cells:
+            aggregations.extend([
+                pl.col(cre_column("cre_hits", cell)).mean().alias(cre_column("n_cre_midpoints", cell)),
+                pl.col(cre_column("cre_avg_signal", cell)).drop_nans().mean().alias(cre_column("cre_avg_signal", cell)),
+                pl.col(cre_column("fraction_cre_bp", cell)).mean().alias(cre_column("fraction_cre_bp", cell)),
+            ])
+
+        final_stats = res_df.group_by(["type", "name"]).agg(aggregations)
 
         final_stats = final_stats.sort(["type", "name"])
         final_stats.write_parquet(output_path)
@@ -378,6 +428,6 @@ def extract_representative_sequence_relative_cre_overlaps(output_path: Path) -> 
 
 
 if __name__ == "__main__":
-    calculate_overlap_statistics(ELEMENT_FILE, ELEMENT_OVERLAPS_OUT)  # 11 min
-    calculate_overlap_statistics(PRIMERS_FILE, PRIMERS_OVERLAPS_OUT)  # 8 min
+    calculate_overlap_statistics(ELEMENT_FILE, ELEMENT_OVERLAPS_OUT)  # 20 min, 8 cell lines
+    calculate_overlap_statistics(PRIMERS_FILE, PRIMERS_OVERLAPS_OUT)  # 11 min, 8 cell lines
     extract_representative_sequence_relative_cre_overlaps(REPR_SEQ_OVERLAPS)  # 2 sec
