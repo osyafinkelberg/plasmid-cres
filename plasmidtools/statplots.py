@@ -39,7 +39,7 @@ FONT_SIZES = {
 
 # `functional_profiling_plot` sizing. Height follows the row count and width the
 # metric count, so the same call renders a 60-row and a 600-row view legibly.
-LABEL_ROWS_THRESHOLD = 120    # above this, rows get block labels instead of ids
+LABEL_ROWS_THRESHOLD = 150    # above this, rows get block labels instead of ids
 PER_ROW_HEIGHT = 0.25         # inches per labelled row - room for its text
 DENSE_ROW_HEIGHT = 0.024      # inches per unlabelled row - a visible band
 HEIGHT_OVERHEAD = 4.0         # inches of non-heatmap chrome
@@ -443,6 +443,7 @@ def functional_profiling_plot(
     title: str | None = None,
     show_ylabels: bool | None = None,
     annotations: list[str] | None = None,
+    group_label_column: str = "cluster_label",
 ) -> sns.matrix.ClusterGrid:
     """Ordered heatmap of the functional-profile clustering.
 
@@ -464,6 +465,10 @@ def functional_profiling_plot(
         Names of `ROW_ANNOTATIONS` entries to draw as extra row-colour strips
         beside the element-type strip. All share one concern scale and one
         colourbar. Omit for the plain heatmap.
+    group_label_column : str
+        Column naming each priority block, used for the block labels of the
+        dense view. Falls back to `P<n>` when the column is absent, so a table
+        written before the categories existed still plots.
     """
     df_clustered, heatmap_df = df_clustered.to_pandas(), heatmap_df.to_pandas()
     n_rows = len(df_clustered)
@@ -550,9 +555,13 @@ def functional_profiling_plot(
             va='center',
         )
     else:
+        block_names = (
+            df_clustered[group_label_column] if group_label_column in df_clustered.columns
+            else pd.Series([f"P{group}" for group in groups], index=df_clustered.index)
+        )
         ax_heat.yaxis.set_ticks([(a + b) / 2 for a, b in itertools.pairwise(bounds)])
         ax_heat.set_yticklabels(
-            [f"P{groups[a]} - n={b - a}" for a, b in itertools.pairwise(bounds)],
+            [f"{block_names.iloc[a]} - n={b - a}" for a, b in itertools.pairwise(bounds)],
             rotation=0,
             fontsize=FONT_SIZES["group_label"],
             fontweight='bold',

@@ -2,7 +2,6 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
-from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
 # --- CONFIGURATION ---
@@ -82,8 +81,35 @@ METRIC_COLUMNS = (
     + list(TSS_METRIC_SPECS)
 )
 
-N_CLUSTERS = 8
 CRE_LENGTH_THRESH = 100
+
+# --- CATEGORIES ---
+# Elements are typed in the plane of the CRE and TSS halves of the composite
+# score - the two quantities the composite is already built from - rather than
+# clustered in the 20 metric columns. In the full column space the strongest
+# splits separate `n_tss_midpoints` from `tss_avg_signal`, which are nearly
+# independent of one another (rho -0.20 among elements where either fires) and
+# carry a quarter of the score each; that is a split between two ways of
+# measuring initiation, not between two kinds of element. Averaging each group
+# to one axis removes it and leaves axes that name themselves.
+#
+# The cut-offs are applied directly rather than through k-means, so an element's
+# category depends only on its own two scores: the same element always lands in
+# the same category, whatever else is in the table.
+CATEGORY_ACTIVE = 0.35  # below this on both axes an element is inactive
+CATEGORY_STRONG = 1.0   # at or above this an element is strong on that axis
+
+# Display order, and the order `priority_group` numbers follow.
+CATEGORY_ORDER = [
+    "enhancer & promoter",
+    "promoter-only",
+    "enhancer-only",
+    "weak promoter",
+    "weak enhancer",
+    "inactive",
+]
+# Categories whose CRE or TSS evidence is strong enough to call a candidate.
+STRONG_CATEGORIES = ["enhancer & promoter", "promoter-only", "enhancer-only"]
 
 
 def split_metric(column: str) -> tuple[str, str | None]:
@@ -113,18 +139,36 @@ def metric_threshold(column: str) -> float:
     return CRE_SIGNAL_THRESH[cell]
 
 
+def metric_group_mask(columns: list[str]) -> np.ndarray:
+    """True where a metric column belongs to the TSS group, False for the CRE group."""
+    return np.array([split_metric(column)[0] in TSS_METRIC_SPECS for column in columns])
+
+
 def metric_group_weights(columns: list[str]) -> np.ndarray:
     """Per-column weights giving the CRE and TSS groups a fixed share each.
 
     Each group's weight is spread evenly over its columns, so adding cell lines
     changes the resolution of the CRE side without changing how much it counts.
     """
-    is_tss = np.array([split_metric(column)[0] in TSS_METRIC_SPECS for column in columns])
+    is_tss = metric_group_mask(columns)
     weights = np.where(is_tss, TSS_WEIGHT, CRE_WEIGHT).astype(float)
     for group in (is_tss, ~is_tss):
         if group.any():
             weights[group] /= group.sum()
     return weights
+
+
+def category_name(cre_score: float, tss_score: float) -> str:
+    """Name an element from where it sits on the CRE and TSS axes."""
+    if cre_score < CATEGORY_ACTIVE and tss_score < CATEGORY_ACTIVE:
+        return "inactive"
+    if cre_score >= CATEGORY_STRONG and tss_score >= CATEGORY_STRONG:
+        return "enhancer & promoter"
+    if tss_score >= CATEGORY_STRONG:
+        return "promoter-only"
+    if cre_score >= CATEGORY_STRONG:
+        return "enhancer-only"
+    return "weak promoter" if tss_score > cre_score else "weak enhancer"
 
 
 def available_metric_columns(columns) -> list[str]:
@@ -145,8 +189,6 @@ def functional_profile_clustering(
     metric_labels: list[str],
     metric_thresh: list[float],
     metric_weights: np.ndarray,
-    n_clusters: int,
-    breadth_coeff: int = 50,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
 
     # --- 1. Data Preparation & Normalization ---
@@ -161,11 +203,6 @@ def functional_profile_clustering(
     thresh_matrix = np.array(metric_thresh)
     activity_mask = df_pd[metric_columns].values >= thresh_matrix
 
-    # Measure how broadly an element is active, as a group-weighted share of its
-    # metrics rather than a raw column count, so breadth is not decided by
-    # whichever group happens to contribute more columns
-    active_breadth = (activity_mask * metric_weights).sum(axis=1)
-
     # Apply logic: If below raw threshold, mute interest contribution to 0.0
     effective_z = np.where(activity_mask, scaled_data, 0.0)
 
@@ -173,47 +210,33 @@ def functional_profile_clustering(
     clipped_z = np.clip(effective_z, 0, 3.0)
 
     # Weight by metric group, then compute the robust composite interest score
-    weighted_z = clipped_z * metric_weights
-    composite_interest = weighted_z.sum(axis=1)
+    composite_interest = (clipped_z * metric_weights).sum(axis=1)
 
-    # --- 3. K-Means Clustering on Robust Profiles ---
-    # Clustering on weighted_z ensures groups are formed by overall activation
-    # patterns, on the same group balance the composite score uses
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
-    df_pd['raw_cluster'] = kmeans.fit_predict(weighted_z)
-
-    # Attach tracking metrics to the DataFrame
-    df_pd['active_breadth'] = active_breadth
+    # --- 3. Type Elements on the CRE and TSS Axes ---
+    # The axes are the unweighted group means: they say what kind of element this
+    # is, while CRE_WEIGHT / TSS_WEIGHT say how much each kind counts towards the
+    # composite. Keeping the two separate lets the weighting change without
+    # redrawing the categories.
+    is_tss = metric_group_mask(metric_columns)
+    df_pd['cre_score'] = clipped_z[:, ~is_tss].mean(axis=1)
+    df_pd['tss_score'] = clipped_z[:, is_tss].mean(axis=1)
     df_pd['composite_z_score'] = composite_interest
 
-    # --- 4. Rank Clusters by Multi-Metric Activity ---
-    # Group by cluster and find the average breadth of activity and signal magnitude
-    cluster_profiles = df_pd.groupby('raw_cluster').agg({
-        'active_breadth': 'mean',
-        'composite_z_score': 'mean'
-    })
+    df_pd['cluster_label'] = [
+        category_name(cre, tss) for cre, tss in zip(df_pd['cre_score'], df_pd['tss_score'])
+    ]
+    df_pd['priority_group'] = [CATEGORY_ORDER.index(label) + 1 for label in df_pd['cluster_label']]
 
-    # Rank clusters: Primary weight on breadth of activity, secondary weight on signal strength
-    cluster_rank_metric = (cluster_profiles['active_breadth'] * breadth_coeff) + cluster_profiles['composite_z_score']
-    ranked_clusters = cluster_rank_metric.rank(ascending=False, method='min').astype(int)
-    priority_mapping = ranked_clusters.to_dict()
-
-    # Map priority ranks back to elements (Priority 1 = Best)
-    df_pd['priority_group'] = df_pd['raw_cluster'].map(priority_mapping)
-
-    # --- 5. Sort Elements for Visualization ---
-    # Sort strictly by Priority Group (asc), then breadth of activity (desc), then remaining signal (desc)
+    # --- 4. Sort Elements for Visualization ---
+    # Sort by category (in CATEGORY_ORDER), then by composite score (desc)
     df_sorted = df_pd.sort_values(
-        by=['priority_group', 'active_breadth', 'composite_z_score'], 
-        ascending=[True, False, False]
+        by=['priority_group', 'composite_z_score'],
+        ascending=[True, False]
     ).reset_index(drop=True)
 
     # Re-extract standard unclipped Z-scores for visualization so raw magnitudes remain visible on the plot
     heatmap_data = scaler.transform(df_sorted[metric_columns])
     df_heatmap = pl.DataFrame(heatmap_data, schema=metric_labels)
-
-    # Clean intermediate tracking columns before returning
-    df_sorted = df_sorted.drop(columns=['raw_cluster', 'active_breadth'])
 
     return pl.from_pandas(df_sorted), df_heatmap
 
@@ -268,7 +291,7 @@ if __name__ == "__main__":
         .with_columns(pl.col(col_name).fill_null(0) for col_name in ALL_METRIC_COLUMNS)
     )
     df_clustered, df_heatmap = functional_profile_clustering(
-        df, METRIC_COLUMNS, METRIC_LABELS, METRIC_THRESH, METRIC_WEIGHTS, N_CLUSTERS
+        df, METRIC_COLUMNS, METRIC_LABELS, METRIC_THRESH, METRIC_WEIGHTS
     )
     df_heatmap.write_csv(OUT_CLUSTER_RAW_HEAT)
 
@@ -277,7 +300,7 @@ if __name__ == "__main__":
         is_cryptic_cre=(
             (~pl.col("type").is_in(["promoter", "enhancer"])) &
             (pl.col("element_length") >= CRE_LENGTH_THRESH) &
-            (pl.col("priority_group") <= N_CLUSTERS - 1)
+            (pl.col("cluster_label").is_in(STRONG_CATEGORIES))
         )
     )
     df_clustered.write_csv(OUT_CLUSTER_RAW)
