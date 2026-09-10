@@ -197,6 +197,28 @@ def extract_cds_aa_to_fasta() -> None:
     pl.DataFrame(unique_id_rows).write_parquet(OUT_UNIQUE_SEQUENCE_IDS_CDS)
 
 
+def align_with_mafft(fasta_file: Path, alignment_file: Path) -> str | None:
+    """Align a FASTA with MAFFT unless its alignment already exists.
+
+    Returns an error message, or None on success. An empty output file is
+    removed so a later run retries rather than reading a truncated alignment.
+    """
+    if alignment_file.exists():
+        return None
+
+    command = f"module load mafft/7.305 && mafft --auto {fasta_file!s}"
+    try:
+        with open(alignment_file, "w") as out:
+            subprocess.run(command, shell=True, check=True, stdout=out, stderr=subprocess.DEVNULL)
+    except Exception as e:  # noqa: BLE001
+        return str(e)
+    finally:
+        if alignment_file.exists() and alignment_file.stat().st_size == 0:
+            alignment_file.unlink()
+
+    return None if alignment_file.exists() else "MAFFT produced no alignment"
+
+
 def make_and_analyze_msa():
     individual_metrics = []
     aggregated_metrics = []
@@ -213,21 +235,49 @@ def make_and_analyze_msa():
     for fasta_file in tqdm(fasta_files, desc="Aligning and generating PWMs"):
         current_file_stem = fasta_file.stem
         msa_file = fasta_file.with_suffix(".aln")
+        records = list(SeqIO.parse(fasta_file, "fasta"))
 
-        # 1. Generate MSA using MAFFT
-        if not msa_file.exists():
-            command = f"module load mafft/7.305 && mafft --auto {fasta_file!s}"
-            try:
-                with open(msa_file, "w") as out:
-                    subprocess.run(command, shell=True, check=True, stdout=out, stderr=subprocess.DEVNULL)
-            except Exception as e:  # noqa: BLE001
-                errors_log.append({"file_name": current_file_stem, "error_loc": "mafft run", "error": str(e)})
-                continue
-            finally:
-                if msa_file.exists() and msa_file.stat().st_size == 0:
-                    msa_file.unlink()
+        if not records:
+            errors_log.append({"file_name": current_file_stem, "error_loc": "read fasta", "error": "no sequences"})
+            continue
 
-        # 2. Load the Alignment
+        # 1. A single unique variant needs no alignment. Every instance carries
+        # the same sequence, so it is its own consensus and identity is 1 by
+        # definition - these are the most conserved elements, not failures.
+        if len(records) == 1:
+            record = records[0]
+            unique_id = record.description
+            element_type, element_name, n_instances = uid_meta[unique_id]
+            consensus_str = str(record.seq).upper()
+            file_name = unique_id.split("|||")[0]
+
+            individual_metrics.append({
+                "element_type": element_type,
+                "element_name": element_name,
+                "file_name": file_name,
+                "unique_id": unique_id,
+                "n_instances": n_instances,
+                "identity_to_consensus": 1.0
+            })
+            aggregated_metrics.append({
+                "element_type": element_type,
+                "element_name": element_name,
+                "file_name": file_name,
+                "consensus_seq": consensus_str,
+                "avg_identity": 1.0,
+                "n_instances_total": n_instances,
+                "n_instances_unique": 1,
+                "alignment_length": len(consensus_str)
+            })
+            continue
+
+        # 2. Generate MSA using MAFFT
+        mafft_error = align_with_mafft(fasta_file, msa_file)
+        if mafft_error is not None:
+            errors_log.append({"file_name": current_file_stem, "error_loc": "mafft run", "error": mafft_error})
+            continue
+
+        # 3. Load the Alignment
         try:
             alignment = AlignIO.read(msa_file, "fasta")
             for record in alignment:
@@ -235,14 +285,8 @@ def make_and_analyze_msa():
         except Exception as e:  # noqa: BLE001
             errors_log.append({"file_name": current_file_stem, "error_loc": "read alignment", "error": str(e)})
             continue
-        finally:
-            if msa_file.exists() and msa_file.stat().st_size == 0:
-                msa_file.unlink()
 
-        if len(alignment) < 2:
-            continue
-
-        # 3. Create Motif object & Consensus
+        # 4. Create Motif object & Consensus
         m = motifs.create(alignment)
         try:
             consensus_seq = m.counts.calculate_consensus(identity=0.5)
@@ -259,7 +303,7 @@ def make_and_analyze_msa():
         c_arr = np.frombuffer(consensus_str.encode(), dtype='S1')
         identities = []
 
-        # 4. Calculate Divergence Metrics
+        # 5. Calculate Divergence Metrics
         n_instances_total = 0
         for record in alignment:
             unique_id = record.description
@@ -304,6 +348,42 @@ def make_and_analyze_msa():
     pl.DataFrame(errors_log).write_csv(MSA_ERROR_LOG, separator="\t")
 
 
+def codon_nucleotide_identity(unique_nuc_ids, uid_nt_seq: dict, coding_len: int) -> float | None:
+    """Mean identity of the nucleotide sequences encoding one amino acid variant.
+
+    Their coding regions are implicitly aligned - all encode the same protein and
+    so share a length of 3 * aa_len - which makes a position-wise consensus valid
+    without running a second alignment. Returns None when no nucleotide sequence
+    is long enough to cover the coding region.
+    """
+    nt_coding_seqs = [
+        seq[:coding_len]
+        for seq in (uid_nt_seq.get(nuc_id) for nuc_id in unique_nuc_ids)
+        if seq is not None and len(seq) >= coding_len
+    ]
+    if not nt_coding_seqs:
+        return None
+    if len(nt_coding_seqs) == 1:
+        return 1.0
+
+    # Build position-wise consensus of the coding NT sequences
+    nt_consensus_chars = []
+    for i in range(coding_len):
+        nt_col_counts = defaultdict(int)
+        for seq in nt_coding_seqs:
+            nt_col_counts[seq[i]] += 1
+        best_nt = max(nt_col_counts, key=nt_col_counts.get)
+        nt_consensus_chars.append(best_nt if nt_col_counts[best_nt] / len(nt_coding_seqs) >= 0.5 else 'N')
+
+    # optimization: Convert NT consensus to byte array once for fast vectorized comparisons
+    nt_c_arr = np.frombuffer(''.join(nt_consensus_chars).encode(), dtype='S1')
+    nt_identities = [
+        float(np.mean(np.frombuffer(seq.encode(), dtype='S1') == nt_c_arr))
+        for seq in nt_coding_seqs
+    ]
+    return float(np.mean(nt_identities))
+
+
 def make_and_analyze_msa_cds():
     individual_metrics = []
     aggregated_metrics = []
@@ -324,25 +404,53 @@ def make_and_analyze_msa_cds():
     fasta_cds_files = sorted(FASTA_CDS_DIR.glob("*.fasta"))
     for fasta_cds_file in tqdm(fasta_cds_files, desc="Aligning CDS and generating PWMs"):
         current_file_stem = fasta_cds_file.stem
-
-        # 1. Amino acid alignment (sequences from FASTA_CDS_DIR)
         aa_aln_file = fasta_cds_file.with_suffix(".aln")
+        records = list(SeqIO.parse(fasta_cds_file, "fasta"))
 
-        if not aa_aln_file.exists():
-            command = f"module load mafft/7.305 && mafft --auto {fasta_cds_file!s}"
-            try:
-                with open(aa_aln_file, "w") as out:
-                    subprocess.run(command, shell=True, check=True, stdout=out, stderr=subprocess.DEVNULL)
-            except Exception as e:  # noqa: BLE001
-                errors_log.append({"file_name": current_file_stem, "error_loc": "mafft aa run", "error": str(e)})
-            finally:
-                if aa_aln_file.exists() and aa_aln_file.stat().st_size == 0:
-                    aa_aln_file.unlink()
-
-        if not aa_aln_file.exists():
+        if not records:
+            errors_log.append({"file_name": current_file_stem, "error_loc": "read fasta", "error": "no sequences"})
             continue
 
-        # 2. Load the Alignment
+        # 1. A single unique protein variant needs no alignment: it is its own
+        # consensus and its AA identity is 1 by definition. The nucleotide
+        # divergence is still computed, since several codon variants can encode
+        # that one protein.
+        if len(records) == 1:
+            record = records[0]
+            unique_id = record.description
+            element_type, element_name, n_instances, unique_nuc_ids, n_unique_nuc_ids = uid_aa_meta[unique_id]
+            consensus_str = str(record.seq).upper()
+            file_name = unique_id.split("|||")[0]
+
+            individual_metrics.append({
+                "element_type": element_type,
+                "element_name": element_name,
+                "file_name": file_name,
+                "unique_id": unique_id,
+                "n_instances": n_instances,
+                "n_unique_nuc_ids": n_unique_nuc_ids,
+                "aa_identity_to_consensus": 1.0,
+                "nuc_avg_identity": codon_nucleotide_identity(unique_nuc_ids, uid_nt_seq, len(consensus_str) * 3)
+            })
+            aggregated_metrics.append({
+                "element_type": element_type,
+                "element_name": element_name,
+                "file_name": file_name,
+                "consensus_seq": consensus_str,
+                "avg_identity": 1.0,
+                "n_instances_total": n_instances,
+                "n_instances_unique": 1,
+                "alignment_length": len(consensus_str)
+            })
+            continue
+
+        # 2. Amino acid alignment (sequences from FASTA_CDS_DIR)
+        mafft_error = align_with_mafft(fasta_cds_file, aa_aln_file)
+        if mafft_error is not None:
+            errors_log.append({"file_name": current_file_stem, "error_loc": "mafft aa run", "error": mafft_error})
+            continue
+
+        # 3. Load the Alignment
         try:
             alignment = AlignIO.read(aa_aln_file, "fasta")
             for record in alignment:
@@ -351,10 +459,7 @@ def make_and_analyze_msa_cds():
             errors_log.append({"file_name": current_file_stem, "error_loc": "read aa alignment", "error": str(e)})
             continue
 
-        if len(alignment) < 2:
-            continue
-
-        # 3. Compute AA consensus manually (motifs module is DNA-specific)
+        # 4. Compute AA consensus manually (motifs module is DNA-specific)
         try:
             aln_len = alignment.get_alignment_length()
             consensus_chars = []
@@ -379,7 +484,7 @@ def make_and_analyze_msa_cds():
         identities = []
         n_instances_total = 0
 
-        # 4. Calculate Divergence Metrics
+        # 5. Calculate Divergence Metrics
         for record in alignment:
             unique_id = record.description
             element_type, element_name, n_instances, unique_nuc_ids, n_unique_nuc_ids = uid_aa_meta[unique_id]
@@ -397,39 +502,12 @@ def make_and_analyze_msa_cds():
             identities.append(aa_identity)
             n_instances_total += n_instances
 
-            # 5. Codon-aware NT divergence: NT seqs encoding this AA are implicitly aligned
+            # 6. Codon-aware NT divergence: NT seqs encoding this AA are implicitly aligned
             # (coding length = 3 * aa_len, identical across all seqs encoding the same AA)
             aa_len = int(np.sum(s_arr != b'-'))
             coding_len = aa_len * 3
 
-            nt_coding_seqs = []
-            for nuc_id in unique_nuc_ids:
-                nt_seq = uid_nt_seq.get(nuc_id)
-                if nt_seq is not None and len(nt_seq) >= coding_len:
-                    nt_coding_seqs.append(nt_seq[:coding_len])
-
-            if not nt_coding_seqs:
-                nuc_avg_identity = None
-            elif len(nt_coding_seqs) == 1:
-                nuc_avg_identity = 1.0
-            else:
-                # Build position-wise consensus of the coding NT sequences
-                nt_consensus_chars = []
-                for i in range(coding_len):
-                    nt_col_counts = defaultdict(int)
-                    for s in nt_coding_seqs:
-                        nt_col_counts[s[i]] += 1
-                    best_nt = max(nt_col_counts, key=nt_col_counts.get)
-                    nt_consensus_chars.append(best_nt if nt_col_counts[best_nt] / len(nt_coding_seqs) >= 0.5 else 'N')
-                nt_consensus = ''.join(nt_consensus_chars)
-
-                # optimization: Convert NT consensus to byte array once for fast vectorized comparisons
-                nt_c_arr = np.frombuffer(nt_consensus.encode(), dtype='S1')
-                nt_identities = []
-                for nt_seq in nt_coding_seqs:
-                    nt_s_arr = np.frombuffer(nt_seq.encode(), dtype='S1')
-                    nt_identities.append(float(np.mean(nt_s_arr == nt_c_arr)))
-                nuc_avg_identity = float(np.mean(nt_identities))
+            nuc_avg_identity = codon_nucleotide_identity(unique_nuc_ids, uid_nt_seq, coding_len)
 
             individual_metrics.append({
                 "element_type": element_type,

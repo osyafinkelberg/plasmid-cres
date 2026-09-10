@@ -9,6 +9,8 @@ from sklearn.preprocessing import StandardScaler
 ADDGENE_DIR = Path().cwd().parent / "data/addgene"
 ELEMENT_OVERLAPS = ADDGENE_DIR / "mammalian_plasmids_element_cre_overlaps.parquet"
 ELEMENT_CITATIONS = ADDGENE_DIR / "citations_addgene_elements.parquet"
+PROMOTER_DISTANCE = ADDGENE_DIR / "mammalian_plasmids_element_promoter_distance.parquet"
+ELEMENT_DIVERGENCE = Path().cwd().parent / "data/addgene_alignments/element_average_divergence.parquet"
 CREST_THRESHOLDS = Path().cwd().parent / "../mpra-predictor/data/cre_thresholds_fdr_001.csv"
 
 OUT_CLUSTER_RAW = ADDGENE_DIR / "element_cre_overlap_clustering.csv"
@@ -16,6 +18,14 @@ OUT_CLUSTER_RAW_HEAT = ADDGENE_DIR / "element_cre_overlap_clustering_heatmap.csv
 
 ID_COLUMNS = ["type", "name", "element_length"]
 POPULARITY_COLUMNS = ["n_plasmids", "n_citations"]
+
+# Carried through to the written table so the heatmap can annotate its rows with
+# them, but deliberately kept out of METRIC_COLUMNS: they describe an element's
+# context rather than its predicted activity, and must not shape the clusters.
+ANNOTATION_COLUMNS = [
+    "promoter_distance_mean", "promoter_distance_median", "is_reference_element",
+    "sequence_diversity_pct", "n_sequence_variants",
+]
 
 # --- METRIC REGISTRY ---
 # `cre_avg_signal` deliberately carries no fixed threshold. CREST activity scales
@@ -25,14 +35,17 @@ POPULARITY_COLUMNS = ["n_plasmids", "n_citations"]
 # threshold used in `07_cre_annotation.py`
 PER_CELL_THRESHOLD = None
 
+# Entries are (description, heatmap label, threshold). The heatmap label is kept
+# short because it is drawn once per cell line as a rotated tick label, where the
+# full description would repeat six times and swamp the figure.
 CRE_METRIC_SPECS = {
-    "n_cre_midpoints": ("# CRE Midpoints per Feature Instance", 0.25),
-    "cre_avg_signal": ("Average activity of CRE base pairs", PER_CELL_THRESHOLD),
-    "fraction_cre_bp": ("Fraction base pairs that are CRE", 0.1),
+    "n_cre_midpoints": ("# CRE Midpoints per Feature Instance", "# CRE midpoints", 0.25),
+    "cre_avg_signal": ("Average activity of CRE base pairs", "Mean CRE activity", PER_CELL_THRESHOLD),
+    "fraction_cre_bp": ("Fraction base pairs that are CRE", "Fraction CRE bp", 0.1),
 }
 TSS_METRIC_SPECS = {
-    "n_tss_midpoints": ("# TSS Midpoints per Feature Instance", 0.25),
-    "tss_avg_signal": ("Average activity of TSS base pairs", 0.1),
+    "n_tss_midpoints": ("# TSS Midpoints per Feature Instance", "# TSS midpoints", 0.25),
+    "tss_avg_signal": ("Average activity of TSS base pairs", "Mean TSS activity", 0.1),
 }
 
 CRE_SIGNAL_THRESH_SCALE = 1.15  # strict thresholding, as in 07_cre_annotation.py
@@ -48,8 +61,11 @@ CRE_SIGNAL_THRESH = {
 # CLUSTERING_CELLS = ["GM12878", "Jurkat", "MRC5", "A549", "HEK293T", "K562", "SHSY5Y", "SiHa"]
 CLUSTERING_CELLS = ["GM12878", "MRC5", "A549", "HEK293T", "K562", "SHSY5Y"]
 
+# Metric-major: every cell line's `# CRE midpoints` sits together, then every
+# `Mean CRE activity`, and so on. The heatmap draws columns in this order, so
+# related columns stay adjacent without relying on a clustering dendrogram.
 METRIC_COLUMNS = (
-    [f"{metric} ({cell})" for cell in CLUSTERING_CELLS for metric in CRE_METRIC_SPECS]
+    [f"{metric} ({cell})" for metric in CRE_METRIC_SPECS for cell in CLUSTERING_CELLS]
     + list(TSS_METRIC_SPECS)
 )
 
@@ -64,19 +80,19 @@ def split_metric(column: str) -> tuple[str, str | None]:
 
 
 def metric_label(column: str) -> str:
-    """Heatmap column label for a metric column, cell-line suffix and all."""
+    """Short heatmap column label for a metric column, cell-line suffix and all."""
     base, cell = split_metric(column)
     if base in TSS_METRIC_SPECS:
-        return TSS_METRIC_SPECS[base][0]
-    return f"{CRE_METRIC_SPECS[base][0]} [{cell}]"
+        return TSS_METRIC_SPECS[base][1]
+    return f"{CRE_METRIC_SPECS[base][1]} [{cell}]"
 
 
 def metric_threshold(column: str) -> float:
     """Physical activity threshold a metric column must clear to count as active."""
     base, cell = split_metric(column)
     if base in TSS_METRIC_SPECS:
-        return TSS_METRIC_SPECS[base][1]
-    threshold = CRE_METRIC_SPECS[base][1]
+        return TSS_METRIC_SPECS[base][2]
+    threshold = CRE_METRIC_SPECS[base][2]
     if threshold is not PER_CELL_THRESHOLD:
         return threshold
     if cell is None:
@@ -88,7 +104,7 @@ def available_metric_columns(columns) -> list[str]:
     """Every metric the overlaps table supports, CRE metrics once per cell line."""
     prefix = "cre_avg_signal ("
     cells = [column[len(prefix):-1] for column in columns if column.startswith(prefix)]
-    return [f"{metric} ({cell})" for cell in cells for metric in CRE_METRIC_SPECS] + list(TSS_METRIC_SPECS)
+    return [f"{metric} ({cell})" for metric in CRE_METRIC_SPECS for cell in cells] + list(TSS_METRIC_SPECS)
 
 
 METRIC_LABELS = [metric_label(column) for column in METRIC_COLUMNS]
@@ -179,10 +195,24 @@ if __name__ == "__main__":
         .agg(pl.col("length").median().cast(pl.Int64))
         .rename({"length": "element_length"})
     )
+    promoter_distance = pl.read_parquet(PROMOTER_DISTANCE).select(
+        ["element_type", "element_name", "promoter_distance_mean", "promoter_distance_median", "is_reference_element"]
+    )
+    # Divergence from the element's MSA consensus, as a percentage. Stored in
+    # percent rather than as a fraction because the values span four orders of
+    # magnitude, and percent is what the figure and any caption quote.
+    sequence_diversity = pl.read_parquet(ELEMENT_DIVERGENCE).select([
+        "element_type",
+        "element_name",
+        (100.0 * (1.0 - pl.col("avg_identity"))).alias("sequence_diversity_pct"),
+        pl.col("n_instances_unique").alias("n_sequence_variants"),
+    ])
     element_cre_overlap = (
         pl.read_parquet(ELEMENT_OVERLAPS)
         .join(element_citations[["element_type", "element_name", "n_plasmids", "n_citations"]], left_on=["type", "name"], right_on=["element_type", "element_name"], how="left")
         .join(element_lengths, left_on=["type", "name"], right_on=["element_type", "element_name"], how="left")
+        .join(promoter_distance, left_on=["type", "name"], right_on=["element_type", "element_name"], how="left")
+        .join(sequence_diversity, left_on=["type", "name"], right_on=["element_type", "element_name"], how="left")
         .with_columns(pl.max_horizontal("tss_fwd_avg_signal", "tss_rev_avg_signal").alias("tss_avg_signal"))
     )
 
@@ -201,7 +231,7 @@ if __name__ == "__main__":
     df = (
         element_cre_overlap
         .filter(pl.col("element_length") >= CRE_LENGTH_THRESH)
-        [ID_COLUMNS + ALL_METRIC_COLUMNS + POPULARITY_COLUMNS]
+        [ID_COLUMNS + ALL_METRIC_COLUMNS + POPULARITY_COLUMNS + ANNOTATION_COLUMNS]
         .with_columns(pl.col(col_name).fill_null(0) for col_name in ALL_METRIC_COLUMNS)
     )
     df_clustered, df_heatmap = functional_profile_clustering(df, METRIC_COLUMNS, METRIC_LABELS, METRIC_THRESH, N_CLUSTERS)

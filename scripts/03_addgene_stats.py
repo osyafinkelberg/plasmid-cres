@@ -18,6 +18,10 @@ PLASMID_STATS_OUT = ADDGENE_DIR / "mammalian_plasmids_statistics.parquet"
 ELEMENT_CITATIONS_OUT = ADDGENE_DIR / "citations_addgene_elements.parquet"
 PRIMERS_CITATIONS_OUT = ADDGENE_DIR / "citations_addgene_primers.parquet"
 
+MANUAL_DIR = CUR_DIR.parent.parent / "data/manual_annotations"
+PROMOTER_ANNOTATIONS = MANUAL_DIR / "addgene_promoters_and_enhancers.csv"
+PROMOTER_DISTANCE_OUT = ADDGENE_DIR / "mammalian_plasmids_element_promoter_distance.parquet"
+
 MIN_ORF_NUC_LENGTH = 300
 MIN_INS_NUC_LENTHS = 150
 COMMON_MARKERS = ["puro", "bsd", "zeo", "neo", "hygro", "gfp", "yfp", "cfp", "mcherry", "luciferase"]
@@ -445,6 +449,119 @@ def calculate_element_citation_statistics(elements_path: Path, output_path: Path
     elements_stats.write_parquet(output_path)
 
 
+def mammalian_pol_ii_elements() -> set[tuple[str, str]]:
+    """`(element_type, element_name)` of manually annotated mammalian Pol II CREs.
+
+    `RNA_polymerase` holds one polymerase or several separated by " / ", so the
+    field is split before matching: a plain `str.contains("RNA Pol II")` would
+    also match "RNA Pol III", which is not what is wanted here. Splitting keeps
+    the dual-specificity "RNA Pol II / RNA Pol III" entries (the H1 promoter),
+    which do drive Pol II transcription.
+    """
+    annotations = pl.read_csv(PROMOTER_ANNOTATIONS)
+    qualifying = annotations.filter(
+        pl.col("active_in_mammalian_cells")
+        & pl.col("RNA_polymerase").str.split(" / ").list.contains("RNA Pol II")
+    )
+    return set(qualifying.select(["element_type", "element_name"]).iter_rows())
+
+
+def circular_gap(
+    starts: np.ndarray, lengths: np.ndarray, start: int, length: int, plasmid_length: int
+) -> np.ndarray:
+    """Shortest gap in bp between one element body and each of several others.
+
+    Bodies are arcs on a circular plasmid, given as a start and a length. The gap
+    is 0 when the arcs touch or overlap, otherwise the shorter of the two ways
+    round the plasmid. Distances are edge to edge, not centre to centre, so a
+    long element is not penalised for its own size.
+    """
+    overlaps = ((starts - start) % plasmid_length < length) | (
+        (start - starts) % plasmid_length < lengths
+    )
+    forward = (starts - (start + length)) % plasmid_length
+    backward = (start - (starts + lengths)) % plasmid_length
+    return np.where(overlaps, 0.0, np.minimum(forward, backward).astype(float))
+
+
+def calculate_promoter_proximity(elements_path: Path, output_path: Path) -> None:
+    """Distance from every element to the nearest mammalian Pol II promoter.
+
+    For each element instance the nearest annotated mammalian Pol II
+    promoter/enhancer on the same plasmid is found, then the per-instance
+    distances are averaged over all instances of that element. The reference set
+    includes the element being measured, so an element that is itself such a
+    promoter scores 0.
+
+    Instances on plasmids carrying no annotated promoter score no distance at
+    all; `n_instances_scored` against `n_instances_total` says how much of an
+    element's evidence contributed, so a mean resting on a handful of instances
+    can be spotted.
+    """
+    reference_elements = mammalian_pol_ii_elements()
+    plasmid_length = dict(
+        pl.read_parquet(PLASMID_STATS_OUT).select(["gbk_name", "plasmid_length"]).iter_rows()
+    )
+
+    # Body span per instance, matching the convention used elsewhere for
+    # multi-interval features: first interval's start through last one's end.
+    elements = (
+        pl.read_parquet(elements_path)
+        .with_columns(
+            body_start=pl.col("intervals").list.first().list.first(),
+            body_stop=pl.col("intervals").list.last().list.last(),
+            is_reference=pl.struct(["element_type", "element_name"]).map_elements(
+                lambda row: (row["element_type"], row["element_name"]) in reference_elements,
+                return_dtype=pl.Boolean,
+            ),
+        )
+    )
+
+    records = []
+    for (gbk_name,), plasmid in tqdm(
+        elements.partition_by("gbk_name", as_dict=True).items(), desc="Promoter proximity"
+    ):
+        length = plasmid_length.get(gbk_name)
+        if length is None:
+            continue
+
+        starts = plasmid["body_start"].to_numpy()
+        # A body ending exactly where it starts spans the whole plasmid, not nothing.
+        spans = (plasmid["body_stop"].to_numpy() - starts) % length
+        spans[spans == 0] = length
+        is_reference = plasmid["is_reference"].to_numpy()
+
+        reference_starts, reference_spans = starts[is_reference], spans[is_reference]
+        types, names = plasmid["element_type"].to_list(), plasmid["element_name"].to_list()
+
+        for i in range(plasmid.height):
+            distance = (
+                float(circular_gap(reference_starts, reference_spans, starts[i], spans[i], length).min())
+                if reference_starts.size
+                else None
+            )
+            records.append({"element_type": types[i], "element_name": names[i], "distance": distance})
+
+    proximity = (
+        pl.DataFrame(records)
+        .group_by(["element_type", "element_name"])
+        .agg([
+            pl.col("distance").drop_nulls().mean().alias("promoter_distance_mean"),
+            pl.col("distance").drop_nulls().median().alias("promoter_distance_median"),
+            pl.col("distance").drop_nulls().len().alias("n_instances_scored"),
+            pl.len().alias("n_instances_total"),
+        ])
+        .with_columns(
+            is_reference_element=pl.struct(["element_type", "element_name"]).map_elements(
+                lambda row: (row["element_type"], row["element_name"]) in reference_elements,
+                return_dtype=pl.Boolean,
+            )
+        )
+        .sort(["element_type", "element_name"])
+    )
+    proximity.write_parquet(output_path)
+
+
 if __name__ == "__main__":
     plasmid_download = pl.read_csv(ADDGENE_DIR / "mammalian_plasmids.tsv", separator="\t")
     expected_inserts = {
@@ -464,3 +581,6 @@ if __name__ == "__main__":
     # # 4.
     calculate_element_citation_statistics(ELEMENT_POSITIONS_OUT, ELEMENT_CITATIONS_OUT)
     calculate_element_citation_statistics(PRIMERS_POSITIONS_OUT, PRIMERS_CITATIONS_OUT)
+
+    # # 5.
+    calculate_promoter_proximity(ELEMENT_POSITIONS_OUT, PROMOTER_DISTANCE_OUT)  # ~1 min
