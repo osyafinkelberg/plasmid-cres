@@ -1,12 +1,17 @@
+import itertools
+
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import polars as pl
 import seaborn as sns
 from adjustText import adjust_text
 from matplotlib import gridspec
-from matplotlib.colors import ListedColormap
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import LinearSegmentedColormap, ListedColormap, Normalize
 from matplotlib.lines import Line2D
+from matplotlib.transforms import blended_transform_factory
 from scipy.cluster.hierarchy import fcluster, leaves_list, linkage
 from scipy.spatial.distance import pdist
 
@@ -27,11 +32,14 @@ FONT_SIZES = {
     "row_label": 13,     # per-element ids, one per heatmap row
     "group_label": 15,   # priority-block labels, one per block
     "cbar_tick": 14,
+    "cbar_label": 19,   # colourbar titles, read at figure-panel size
+    "column_group": 18,  # metric name spanning a block of cell-line columns
+    "strip_label": 16,   # names under the row-annotation strips
 }
 
 # `functional_profiling_plot` sizing. Height follows the row count and width the
 # metric count, so the same call renders a 60-row and a 600-row view legibly.
-LABEL_ROWS_THRESHOLD = 100    # above this, rows get block labels instead of ids
+LABEL_ROWS_THRESHOLD = 120    # above this, rows get block labels instead of ids
 PER_ROW_HEIGHT = 0.25         # inches per labelled row - room for its text
 DENSE_ROW_HEIGHT = 0.024      # inches per unlabelled row - a visible band
 HEIGHT_OVERHEAD = 4.0         # inches of non-heatmap chrome
@@ -39,6 +47,94 @@ MAX_FIG_HEIGHT = 32
 PER_METRIC_WIDTH = 1.1        # inches per heatmap column
 WIDTH_OVERHEAD = 5.5          # inches for row colors, legend strip and margins
 MAX_FIG_WIDTH = 24
+
+# Optional per-row annotation strips for `functional_profiling_plot`. These are
+# control metrics, not data: what matters is spotting elements whose CRE metrics
+# may be untrustworthy, not reading a value off a ramp. So each maps its quantity
+# through an explicit ramp to one shared 0-1 concern score and they share a
+# single colormap and colourbar - a dark mark means the same thing in any strip,
+# and the safe majority stays pale.
+CONCERN_CMAP = LinearSegmentedColormap.from_list(
+    "control_concern", ["#f0f0f0", "#fee391", "#fe9929", "#993404"]
+)
+
+LENGTH_SHORT_FLAG = 200    # bp; at or below, a short element is fully flagged
+LENGTH_SHORT_CLEAR = 650   # bp; at or above, shortness is no longer a concern
+LENGTH_LONG_CLEAR = 2000   # bp; at or below, length is no longer a concern
+LENGTH_LONG_FLAG = 4000    # bp; at or above, a long element is fully flagged
+PROMOTER_CLEAR = 300       # bp; a promoter beyond this is unlikely to explain the signal
+DIVERSITY_CLEAR = 5.0      # % divergence tolerated before instances disagree meaningfully
+DIVERSITY_FLAG = 25.0      # % divergence at which one value cannot represent the group
+
+
+def _concern_ramp(values: np.ndarray, clear: float, flag: float) -> np.ndarray:
+    """Clipped linear 0-1 ramp: 0 at `clear`, 1 at `flag`, either direction."""
+    return np.clip((values - clear) / (flag - clear), 0.0, 1.0)
+
+
+def short_length_concern(values: np.ndarray) -> np.ndarray:
+    """A short element's predicted CREs may really belong to the flanking plasmid context."""
+    return _concern_ramp(values, LENGTH_SHORT_CLEAR, LENGTH_SHORT_FLAG)
+
+
+def long_length_concern(values: np.ndarray) -> np.ndarray:
+    """A very long element inflates per-element counts, such as the number of CRE midpoints."""
+    return _concern_ramp(values, LENGTH_LONG_CLEAR, LENGTH_LONG_FLAG)
+
+
+def promoter_distance_concern(values: np.ndarray) -> np.ndarray:
+    """Only proximity is a risk: a promoter close by may explain the activity.
+
+    A large distance carries no risk, and neither does a missing value - it means
+    no annotated promoter shares the plasmid at all, so nothing can be confounding.
+    """
+    concern = _concern_ramp(values, PROMOTER_CLEAR, 0.0)
+    return np.where(np.isnan(values), 0.0, concern)
+
+
+def sequence_diversity_concern(values: np.ndarray) -> np.ndarray:
+    """Only high divergence is a risk: one value cannot represent instances that differ."""
+    return _concern_ramp(values, DIVERSITY_CLEAR, DIVERSITY_FLAG)
+
+
+# Keyed by annotation name rather than by column, because being too short and
+# being too long are separate concerns with different causes and so get a strip
+# each: on one shared colour scale a single two-sided ramp could not say which
+# end a dark mark came from.
+ROW_ANNOTATIONS = {
+    "length_short": {
+        "column": "element_length",
+        "strip": "Short",
+        "rule": f"length < {LENGTH_SHORT_CLEAR} bp",
+        "concern": short_length_concern,
+    },
+    "length_long": {
+        "column": "element_length",
+        "strip": "Long",
+        "rule": f"length > {LENGTH_LONG_CLEAR // 1000} kb",
+        "concern": long_length_concern,
+    },
+    "promoter_distance": {
+        "column": "promoter_distance_mean",
+        "strip": "Promoter dist.",
+        "rule": f"< {PROMOTER_CLEAR} bp",
+        "concern": promoter_distance_concern,
+    },
+    "promoter_distance_median": {
+        "column": "promoter_distance_median",
+        "strip": "Promoter dist.",
+        "rule": f"< {PROMOTER_CLEAR} bp",
+        "concern": promoter_distance_concern,
+    },
+    "sequence_diversity": {
+        "column": "sequence_diversity_pct",
+        "strip": "Diversity",
+        "rule": f"> {DIVERSITY_CLEAR:g}% divergence",
+        "concern": sequence_diversity_concern,
+    },
+}
+ANNOTATION_BAR_HEIGHT = 1.7   # inches, so the concern bar keeps one physical size
+ANNOTATION_BAR_GAP = 1.0      # inches between it and the z-score bar above
 
 ELEMENT_TYPE_PRIORITIES = {
     "CDS": 29, "promoter": 28, "rep_origin": 27, "oriT": 26,
@@ -249,11 +345,104 @@ def plot_regulatory_correlation(
     return fig, ax
 
 
+def _split_column_label(label: str) -> tuple[str, str]:
+    """Split a heatmap column label into its metric and its cell line.
+
+    `"# CRE midpoints [K562]"` becomes `("# CRE midpoints", "K562")`. A label
+    with no bracketed suffix is its own group and has no member - in practice
+    the cell-agnostic TSS metrics, which stand alone.
+    """
+    metric, separator, cell = label.partition(" [")
+    return (metric, cell[:-1]) if separator else (label, "")
+
+
+def _column_groups(labels: list[str]) -> tuple[list[tuple[str, str]], list[list]]:
+    """Parsed labels, plus contiguous runs of columns sharing one metric.
+
+    Runs are contiguous because the caller supplies columns in metric-major
+    order; nothing is reordered here.
+    """
+    parsed = [_split_column_label(label) for label in labels]
+    runs = []
+    for i, (metric, cell) in enumerate(parsed):
+        if runs and runs[-1][0] == metric:
+            runs[-1][1].append(cell)
+            runs[-1][3] = i + 1
+        else:
+            runs.append([metric, [cell], i, i + 1])
+    return parsed, runs
+
+
+def _draw_column_group_tier(ax: plt.Axes, runs: list[list], fontsize: int) -> None:
+    """Draw a second x-axis tier: a bracket and metric name under each run.
+
+    The tier is placed just below whatever vertical space the tick labels
+    actually occupy, which is only knowable after a draw, so one is forced here.
+    Offsets are in points converted to axes fractions, so the tier sits the same
+    distance below the labels whether the figure is 9 or 32 inches tall.
+    """
+    fig = ax.get_figure()
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+
+    labels_bottom = min(t.get_window_extent(renderer).y0 for t in ax.get_xticklabels())
+    y_labels = ax.transAxes.inverted().transform((0, labels_bottom))[1]
+    per_point = (fig.dpi / 72) / ax.get_window_extent(renderer).height
+    line_y = y_labels - 10 * per_point
+    text_y = line_y - 7 * per_point
+
+    trans = blended_transform_factory(ax.transData, ax.transAxes)
+    for metric, cells, start, stop in runs:
+        if not any(cells):
+            continue  # a lone metric already names itself in the tick label
+        ax.plot(
+            [start + 0.12, stop - 0.12], [line_y, line_y], transform=trans,
+            color="#333333", lw=1.6, clip_on=False, solid_capstyle="butt",
+            scalex=False, scaley=False,
+        )
+        ax.text(
+            (start + stop) / 2, text_y, metric, transform=trans,
+            ha="center", va="top", fontsize=fontsize, fontweight="bold", clip_on=False,
+        )
+
+
+def _annotation_colors(values: np.ndarray, spec: dict) -> list:
+    """Row colours for one control metric, on the shared concern scale."""
+    concern = spec["concern"](np.asarray(values, dtype=float))
+    return [CONCERN_CMAP(level) for level in concern]
+
+
+def _concern_colorbar(fig, rect: list, specs: list[dict], fontsize: dict) -> None:
+    """One colourbar for every control strip, with the flagging rules beneath it.
+
+    A single shared bar is the point of the design: the strips do not carry
+    independent units, so three separate bars would invite reading a value where
+    only the level matters. The rules are spelled out underneath so the figure
+    still says what earned a mark.
+    """
+    cax = fig.add_axes(rect)
+    bar = fig.colorbar(ScalarMappable(norm=Normalize(0, 1), cmap=CONCERN_CMAP), cax=cax)
+    bar.set_ticks([0.0, 0.5, 1.0])
+    bar.set_ticklabels(["none", "some", "high"])
+    bar.set_label("Control-metric concern", fontsize=fontsize["cbar_label"])
+    cax.tick_params(labelsize=fontsize["cbar_tick"])
+
+    # Placed well below the bar: a vertical colourbar puts its title on the right,
+    # centred, and that title is longer than the bar itself, so anything closer
+    # than this collides with it.
+    rules = "\n".join(f"{spec['strip']}:  {spec['rule']}" for spec in specs)
+    cax.text(
+        0.0, -0.42, rules, transform=cax.transAxes,
+        ha="left", va="top", fontsize=fontsize["cbar_tick"], linespacing=1.6,
+    )
+
+
 def functional_profiling_plot(
     df_clustered: pl.DataFrame,
     heatmap_df: pl.DataFrame,
     title: str | None = None,
     show_ylabels: bool | None = None,
+    annotations: list[str] | None = None,
 ) -> sns.matrix.ClusterGrid:
     """Ordered heatmap of the functional-profile clustering.
 
@@ -271,6 +460,10 @@ def functional_profiling_plot(
         Force per-element row labels on or off. By default they appear only when
         there are few enough rows to read them; otherwise each priority block
         gets a single label, which is the only structure legible at that density.
+    annotations : list of str, optional
+        Names of `ROW_ANNOTATIONS` entries to draw as extra row-colour strips
+        beside the element-type strip. All share one concern scale and one
+        colourbar. Omit for the plain heatmap.
     """
     df_clustered, heatmap_df = df_clustered.to_pandas(), heatmap_df.to_pandas()
     n_rows = len(df_clustered)
@@ -278,9 +471,23 @@ def functional_profiling_plot(
     # --- 1. Render the Ordered Heatmap ---
     sns.set_theme(style="white", context="paper", font_scale=1.4)
 
-    # Map row colors
-    row_colors = df_clustered['type'].map(lambda x: GENOMIC_COLORS.get(x, '#cccccc'))
-    row_colors.name = "Type"
+    # Map row colors. Extra annotation strips sit between the type strip and the
+    # heatmap, so the reader meets them on the way in from the element labels.
+    annotations = annotations or []
+    missing = [name for name in annotations if ROW_ANNOTATIONS[name]["column"] not in df_clustered.columns]
+    if missing:
+        raise KeyError(f"annotation columns absent from the clustering table: {missing}")
+
+    row_colors = pd.DataFrame(
+        {"Type": df_clustered['type'].map(lambda x: GENOMIC_COLORS.get(x, '#cccccc'))},
+        index=df_clustered.index,
+    )
+    for name in annotations:
+        spec = ROW_ANNOTATIONS[name]
+        row_colors[spec["strip"]] = pd.Series(
+            _annotation_colors(df_clustered[spec["column"]].to_numpy(), spec),
+            index=df_clustered.index, dtype=object,
+        )
 
     # Height follows the row count in both regimes. Labelled rows need room for
     # their text; unlabelled rows only need to stay a visible band, but they do
@@ -306,7 +513,10 @@ def functional_profiling_plot(
         figsize=(fig_width, fig_height),
         dendrogram_ratio=(0.20, 0.06),
         cbar_kws={'label': 'Relative Values\n(Z-Score)'},
-        colors_ratio=0.03
+        colors_ratio=0.03,  # seaborn already scales this by the number of strips
+    )
+    cg.ax_row_colors.set_xticklabels(
+        cg.ax_row_colors.get_xticklabels(), fontsize=FONT_SIZES["strip_label"], rotation=45, ha='right',
     )
 
     # Draw separators between Priority Groups
@@ -317,7 +527,13 @@ def functional_profiling_plot(
         ax_heat.axhline(y=boundary, color='black', linewidth=1.8)
 
     # Formatting
-    ax_heat.set_xticklabels(ax_heat.get_xticklabels(), rotation=45, ha='right', fontsize=FONT_SIZES["tick"])
+    # Columns arrive grouped by metric, so the metric name is factored out into a
+    # second tier below and each tick only has to name its cell line.
+    parsed_columns, column_runs = _column_groups(list(heatmap_df.columns))
+    ax_heat.set_xticklabels(
+        [cell or metric for metric, cell in parsed_columns],
+        rotation=45, ha='right', fontsize=FONT_SIZES["tick"],
+    )
 
     # --- Y-tick labels: element IDs when they fit, priority blocks otherwise ---
     if show_ylabels:
@@ -334,9 +550,9 @@ def functional_profiling_plot(
             va='center',
         )
     else:
-        ax_heat.yaxis.set_ticks([(a + b) / 2 for a, b in zip(bounds[:-1], bounds[1:])])
+        ax_heat.yaxis.set_ticks([(a + b) / 2 for a, b in itertools.pairwise(bounds)])
         ax_heat.set_yticklabels(
-            [f"P{groups[a]} - n={b - a}" for a, b in zip(bounds[:-1], bounds[1:])],
+            [f"P{groups[a]} - n={b - a}" for a, b in itertools.pairwise(bounds)],
             rotation=0,
             fontsize=FONT_SIZES["group_label"],
             fontweight='bold',
@@ -363,50 +579,83 @@ def functional_profiling_plot(
         loc="lower left", bbox_to_anchor=(-0.4, -0.2), frameon=False
     )
     cg.ax_cbar.set_position([0.02, 0.8, 0.03, 0.15])
-    cg.ax_cbar.set_ylabel('Relative Values\n(Z-Score)', fontsize=FONT_SIZES["legend"])
+    cg.ax_cbar.set_ylabel('Relative Values\n(Z-Score)', fontsize=FONT_SIZES["cbar_label"])
     cg.ax_cbar.tick_params(labelsize=FONT_SIZES["cbar_tick"])
+
+    # One shared concern colourbar below the z-score bar, sized in inches
+    # converted to figure fractions so it keeps one physical size across the
+    # 9-32 inch height range the figure spans.
+    if annotations:
+        bar_height = ANNOTATION_BAR_HEIGHT / fig_height
+        bar_gap = ANNOTATION_BAR_GAP / fig_height
+        _concern_colorbar(
+            cg.figure, [0.02, 0.80 - bar_gap - bar_height, 0.03, bar_height],
+            [ROW_ANNOTATIONS[name] for name in annotations], FONT_SIZES,
+        )
+
+    # Last, so the forced draw inside it sees final tick-label extents.
+    _draw_column_group_tier(ax_heat, column_runs, FONT_SIZES["column_group"])
     return cg
 
 
 def combined_prediction_pileups(
-    cre_matrix, fwd_matrix, rev_matrix, element_type, element_name, flank_size
+    cre_matrix, fwd_matrix, rev_matrix, element_type, element_name, flank_size,
+    percentile_bands=((5, 95, 0.15), (25, 75, 0.30)),
 ) -> tuple[plt.Figure, tuple[plt.Axes, plt.Axes]]:
     """
     Plots aligned CREST and stranded Puffin tracks for a specific element.
+
+    Spread across instances is drawn as nested percentile ribbons rather than one
+    translucent polyline per instance. Every instance contributes, where the
+    per-instance version had to cap at 500 traces and so silently showed under
+    1% of the data for the most common elements. It also keeps the vector PDF at
+    a few hundred kilobytes instead of ~16 MB, since a ribbon is two polygons
+    rather than 1500 polylines.
+
+    `percentile_bands` are (low, high, alpha) triples, drawn in the order given,
+    so list the widest first and let the narrower ones darken on top of it.
     """
     total_len = cre_matrix.shape[1]
     element_size = total_len - 2 * flank_size
     x_axis = np.arange(total_len) - flank_size
 
+    # Every level any band needs, evaluated in a single pass per matrix. NaNs are
+    # present in the CREST pileups, so the nan-aware forms are required here and
+    # for the trend lines below.
+    levels = sorted({level for low, high, _ in percentile_bands for level in (low, high)})
+
+    def percentile_curves(matrix: np.ndarray) -> dict[int, np.ndarray]:
+        return dict(zip(levels, np.nanpercentile(matrix, levels, axis=0)))
+
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), sharex=True, gridspec_kw={'height_ratios': [1, 1.2]})
     plt.subplots_adjust(hspace=0.05)  # tight vertical spacing for alignment
 
     # --- TOP SUBPLOT: CREST (Unstranded/Aggregate) ---
-    c_mean = np.nanmean(cre_matrix, axis=0)
-    for i in range(min(len(cre_matrix), 500)): # Plot subset of tracks for clarity
-        ax1.plot(x_axis, cre_matrix[i], color='gray', alpha=0.03, lw=0.5)
-    ax1.plot(x_axis, c_mean, color='crimson', lw=2, label='CREST Mean')
-    ax1.set_ylabel("CREST Signal", fontweight='bold')
+    cre_curves = percentile_curves(cre_matrix)
+    for low, high, alpha in percentile_bands:
+        ax1.fill_between(x_axis, cre_curves[low], cre_curves[high], color='gray', alpha=alpha, lw=0)
+    ax1.plot(x_axis, np.nanmean(cre_matrix, axis=0), color='crimson', lw=2, label='CREST Mean')
+    ax1.set_ylabel("CREST (HEK293T)", fontweight='bold')
     ax1.set_ylim([-1, 8.5])
     ax1.legend(loc='upper right', frameon=False)
 
     # --- BOTTOM SUBPLOT: PUFFIN (Strand-Aware Mirror Plot) ---
-    pf_mean = np.mean(fwd_matrix, axis=0)
-    pr_mean = np.mean(rev_matrix, axis=0)
+    fwd_curves = percentile_curves(fwd_matrix)
+    rev_curves = percentile_curves(rev_matrix)
 
-    # Individual tracks (Strand-aware)
-    for i in range(min(len(fwd_matrix), 500)):
-        ax2.plot(x_axis, fwd_matrix[i], color='royalblue', alpha=0.02, lw=0.5)
-        ax2.plot(x_axis, -rev_matrix[i], color='forestgreen', alpha=0.02, lw=0.5)
+    # Spread per strand, the reverse strand mirrored below the baseline
+    for low, high, alpha in percentile_bands:
+        ax2.fill_between(x_axis, fwd_curves[low], fwd_curves[high], color='royalblue', alpha=alpha, lw=0)
+        ax2.fill_between(x_axis, -rev_curves[high], -rev_curves[low], color='forestgreen', alpha=alpha, lw=0)
 
     # Trend lines
-    ax2.plot(x_axis, pf_mean, color='navy', lw=2, label='Feature Strand (5\'→3\')')
-    ax2.plot(x_axis, -pr_mean, color='darkgreen', lw=2, label='Opposite Strand')
-    
+    ax2.plot(x_axis, np.nanmean(fwd_matrix, axis=0), color='navy', lw=2, label="Feature Strand (5'→3')")
+    ax2.plot(x_axis, -np.nanmean(rev_matrix, axis=0), color='darkgreen', lw=2, label='Opposite Strand')
+
     # Baseline for mirror plot
     ax2.axhline(0, color='black', lw=1, alpha=0.5)
-    
-    ax2.set_ylabel("Puffin Signal (± Strand)", fontweight='bold')
+
+    ax2.set_ylabel("Puffin CAGE (± Strand)", fontweight='bold')
     ax2.set_ylim([-0.5, 0.5])
     ax2.legend(loc='upper right', frameon=False)
 
@@ -423,7 +672,12 @@ def combined_prediction_pileups(
 
     ax2.set_xlabel("Distance from Element Start (bp)", fontweight='bold')
 
-    fig.suptitle(f"Aligned Pileup Profile: {element_type} - {element_name}\n(n={len(cre_matrix)} instances)", fontsize=16, fontweight='bold', y=0.95)
+    # band_text = ", ".join(f"{low}-{high}%" for low, high, _ in percentile_bands)
+    fig.suptitle(
+        f"Aligned Pileup Profile: {element_type} - {element_name}\n"
+        f"(n={len(cre_matrix)} instances)",  # "; shaded bands: {band_text})",
+        fontsize=16, fontweight='bold', y=0.95,
+    )
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     return fig, (ax1, ax2)
 
