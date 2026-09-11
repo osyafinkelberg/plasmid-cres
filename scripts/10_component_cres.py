@@ -2,7 +2,6 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
-from sklearn.preprocessing import StandardScaler
 
 # --- CONFIGURATION ---
 PROJECT_DIR = Path().cwd().parent
@@ -15,12 +14,14 @@ ELEMENT_CITATIONS = ADDGENE_DIR / "citations_addgene_elements.parquet"
 PROMOTER_DISTANCE = ADDGENE_DIR / "mammalian_plasmids_element_promoter_distance.parquet"
 ELEMENT_DIVERGENCE = ALIGN_DIR / "element_average_divergence.parquet"
 
-# Written to their own files so a gated run is not overwritten. Drop the
-# `_nogate` suffixes to make this a drop-in replacement.
+# Written to their own files so a gated run is not overwritten.
 OUT_CLUSTER_RAW = ADDGENE_DIR / "element_cre_overlap_clustering.csv"
 OUT_CLUSTER_RAW_HEAT = ADDGENE_DIR / "element_cre_overlap_clustering_heatmap.csv"
 
 ID_COLUMNS = ["type", "name", "element_length"]
+# Repeated on the heatmap table so it can be joined to the clustering table by
+# key instead of by row position.
+HEATMAP_KEY_COLUMNS = ["type", "name"]
 POPULARITY_COLUMNS = ["n_plasmids", "n_citations"]
 
 # Carried through to the written table so the heatmap can annotate its rows with
@@ -56,6 +57,21 @@ TSS_METRIC_SPECS = {
     "n_tss_midpoints": ("# TSS Midpoints per Feature Instance", "# TSS midpoints"),
     "tss_avg_signal": ("Average activity of TSS base pairs", "Mean TSS activity"),
 }
+
+# Metrics that are conditional on an overlap existing. `08_element_cre_overlap.py`
+# aggregates these with `.drop_nans().mean()`, so they are the mean activity over
+# the instances that had a CRE or TSS, and are simply undefined for an element
+# that has neither anywhere. The remaining metrics count or measure coverage over
+# every instance, so zero is a value they genuinely take.
+#
+# The distinction matters because these columns are standardised. Filling an
+# undefined entry with zero puts it at a value the conditional distribution never
+# takes - in SHSY5Y the mean activity of a called CRE is 2.19 with an SD of 0.62,
+# so an imputed zero sits 3.5 SD below the population and nearly doubles the SD
+# the column is divided by. The entries are therefore left missing and contribute
+# nothing, which is the same treatment an element below the column mean already
+# gets from the clip at zero.
+CONDITIONAL_METRICS = {"cre_avg_signal", "tss_avg_signal"}
 
 # Share of the composite score each metric group carries. The CRE side gains a
 # column per cell line while the TSS side has two columns in total, so an
@@ -159,6 +175,26 @@ def metric_label(column: str) -> str:
     return f"{CRE_METRIC_SPECS[base][1]} [{cell}]"
 
 
+def is_conditional(column: str) -> bool:
+    """True where a column is only defined for elements that have an overlap."""
+    return split_metric(column)[0] in CONDITIONAL_METRICS
+
+
+def standardise(values: np.ndarray) -> np.ndarray:
+    """Column z-scores computed over the observed entries only.
+
+    Replaces `StandardScaler`, which rejects missing values. A column with no
+    spread is left at zero rather than producing NaN, and a column with nothing
+    observed is an error rather than a silently empty one.
+    """
+    observed = np.count_nonzero(~np.isnan(values), axis=0)
+    if (observed == 0).any():
+        raise ValueError("a metric column has no observed values to standardise on")
+    centre = np.nanmean(values, axis=0)
+    spread = np.nanstd(values, axis=0)
+    return (values - centre) / np.where(spread > 0, spread, 1.0)
+
+
 def metric_group_mask(columns: list[str]) -> np.ndarray:
     """True where a metric column belongs to the TSS group, False for the CRE group."""
     return np.array([split_metric(column)[0] in TSS_METRIC_SPECS for column in columns])
@@ -218,16 +254,17 @@ def functional_profile_typing(
     labels = [metric_label(column) for column in metric_columns]
 
     # --- 1. Data Preparation & Normalization ---
-    # StandardScaler rather than a bare z-score: it leaves a zero-variance column
-    # at 0 instead of propagating NaN.
-    raw = df.select(metric_columns).to_numpy()
-    scaled_data = StandardScaler().fit_transform(raw)
+    # Missing entries in the conditional columns stay missing here, so that each
+    # column is centred and scaled on the elements that actually have a value.
+    raw = df.select(pl.col(metric_columns).cast(pl.Float64)).to_numpy()
+    scaled_data = standardise(raw)
 
     # --- 2. Handle Outliers ---
     # Floor at zero so that below-average behaviour is absent evidence rather
     # than evidence against, and cap the maximum z-score per column so single-
-    # column outliers cannot dominate.
-    clipped_z = np.clip(scaled_data, 0, CLIP_Z)
+    # column outliers cannot dominate. An element with no value on a conditional
+    # column contributes nothing, which is the floor applied to absent evidence.
+    clipped_z = np.nan_to_num(np.clip(scaled_data, 0, CLIP_Z), nan=0.0)
 
     # --- 3. Type Elements on the CRE and TSS Axes ---
     # The axes say what kind of element this is, while CRE_WEIGHT / TSS_WEIGHT say
@@ -263,12 +300,24 @@ def functional_profile_typing(
         ["priority_group", "composite_z_score", "source_row"],
         descending=[False, True, False],
     )
+    order = typed["source_row"].to_numpy()
 
-    # Standard unclipped, unmuted z-scores for visualization, reordered to match,
-    # so raw magnitudes remain visible on the plot.
-    df_heatmap = pl.DataFrame(scaled_data[typed["source_row"].to_numpy()], schema=labels)
+    # Standard unclipped z-scores for visualization, reordered to match, so raw
+    # magnitudes remain visible on the plot. Conditional columns stay empty where
+    # the element has no CRE or TSS, so the figure can draw "none called" as a
+    # blank cell (matplotlib `cmap.set_bad`) instead of as a strong negative. The key columns are carried so the
+    # two tables can be joined on `(type, name)` rather than on row position: a
+    # heatmap file that is stale with respect to its clustering file is otherwise
+    # indistinguishable from a fresh one, and mis-annotates every row silently.
+    # A plotting script takes the matrix as `df_heatmap.drop(HEATMAP_KEY_COLUMNS)`.
+    typed = typed.drop("source_row")
+    df_heatmap = pl.concat(
+        [typed.select(HEATMAP_KEY_COLUMNS),
+         pl.DataFrame(scaled_data[order], schema=labels)],
+        how="horizontal",
+    )
 
-    return typed.drop("source_row"), df_heatmap
+    return typed, df_heatmap
 
 
 # --- LOADING ---
@@ -328,7 +377,12 @@ if __name__ == "__main__":
         element_cre_overlap
         .filter(pl.col("element_length") >= CRE_LENGTH_THRESH)
         .select(ID_COLUMNS + all_metric_columns + POPULARITY_COLUMNS + ANNOTATION_COLUMNS)
-        .with_columns(pl.col(all_metric_columns).fill_null(0))
+        # Only the count and coverage metrics: a null there means the element was
+        # absent from a join and zero is the right reading. The conditional
+        # columns keep their nulls, which is what `standardise` expects, and the
+        # written table then distinguishes "no CRE called" from "CRE of zero
+        # activity" instead of writing both as 0.
+        .with_columns(pl.col([c for c in all_metric_columns if not is_conditional(c)]).fill_null(0))
     )
     df_typed, df_heatmap = functional_profile_typing(df, METRIC_COLUMNS)
     df_heatmap.write_csv(OUT_CLUSTER_RAW_HEAT)
