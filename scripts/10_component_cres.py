@@ -23,8 +23,9 @@ ID_COLUMNS = ["type", "name", "element_length"]
 POPULARITY_COLUMNS = ["n_plasmids", "n_citations"]
 
 # Carried through to the written table so the heatmap can annotate its rows with
-# them, but deliberately kept out of METRIC_COLUMNS: they describe an element's
-# context rather than its predicted activity, and must not shape the clusters.
+# them, but deliberately kept out of the metric columns: they describe an
+# element's context rather than its predicted activity, and must not shape the
+# categories.
 ANNOTATION_COLUMNS = [
     "promoter_distance_mean", "promoter_distance_median", "is_reference_element",
     "sequence_diversity_pct", "n_sequence_variants",
@@ -43,9 +44,11 @@ PER_CELL_THRESHOLD = None
 # full description would repeat six times and swamp the figure.
 CRE_METRIC_SPECS = {
     "n_cre_midpoints": ("# CRE Midpoints per Feature Instance", "# CRE midpoints", 0.25),
-    "cre_avg_signal": ("Average activity of CRE base pairs", "Mean CRE activity", PER_CELL_THRESHOLD),
     "fraction_cre_bp": ("Fraction base pairs that are CRE", "Fraction CRE bp", 0.1),
+    "cre_avg_signal": ("Average activity of CRE base pairs", "Mean CRE activity", PER_CELL_THRESHOLD),
 }
+# Unlike the CRE metrics these are not resolved per cell line: the overlaps table
+# carries a single TSS column pair, so the TSS axis has no cross-cell replication.
 TSS_METRIC_SPECS = {
     "n_tss_midpoints": ("# TSS Midpoints per Feature Instance", "# TSS midpoints", 0.25),
     "tss_avg_signal": ("Average activity of TSS base pairs", "Mean TSS activity", 0.1),
@@ -66,38 +69,52 @@ CRE_SIGNAL_THRESH = {
 CRE_WEIGHT = 0.5
 TSS_WEIGHT = 0.5
 
+# How much each metric counts towards its typing axis. On the CRE side the first
+# two metrics grow with element length - a longer element accumulates more CRE
+# midpoints - while the mean activity of the base pairs that are CRE does not.
+# Weights are relative and renormalised within a group, so {1, 1, 1} is a plain
+# mean and {0, 0, 1} types on mean activity alone. This shapes the categories
+# only; the composite score keeps using CRE_WEIGHT / TSS_WEIGHT over all columns
+# equally.
+AXIS_WEIGHTS = {
+    "n_cre_midpoints": 1.0,
+    "fraction_cre_bp": 1.0,
+    "cre_avg_signal": 1.0,
+    "n_tss_midpoints": 1.0,
+    "tss_avg_signal": 1.0,
+}
+
 # --- CLUSTERING ---
-# Every metric above is computed for every cell line and written to OUT_CLUSTER_RAW.
-# Only the columns listed here shape the clusters and the heatmap
+# Every metric is computed for every cell line the overlaps table carries and
+# written to OUT_CLUSTER_RAW. Only the cell lines listed here shape the
+# categories and the heatmap.
 
 # CLUSTERING_CELLS = ["GM12878", "Jurkat", "MRC5", "A549", "HEK293T", "K562", "SHSY5Y", "SiHa"]
 CLUSTERING_CELLS = ["GM12878", "MRC5", "A549", "HEK293T", "K562", "SHSY5Y"]
 
-# Metric-major: every cell line's `# CRE midpoints` sits together, then every
-# `Mean CRE activity`, and so on. The heatmap draws columns in this order, so
-# related columns stay adjacent without relying on a clustering dendrogram.
-METRIC_COLUMNS = (
-    [f"{metric} ({cell})" for metric in CRE_METRIC_SPECS for cell in CLUSTERING_CELLS]
-    + list(TSS_METRIC_SPECS)
-)
-
 CRE_LENGTH_THRESH = 100
+
+# Resolved at the bottom of the module, once the helpers below are defined. The
+# heatmap's own column labels are its header row, so nothing else needs exporting.
+METRIC_COLUMNS: list[str]
 
 # --- CATEGORIES ---
 # Elements are typed in the plane of the CRE and TSS halves of the composite
 # score - the two quantities the composite is already built from - rather than
 # clustered in the 20 metric columns. In the full column space the strongest
-# splits separate `n_tss_midpoints` from `tss_avg_signal`, which are nearly
-# independent of one another (rho -0.20 among elements where either fires) and
-# carry a quarter of the score each; that is a split between two ways of
-# measuring initiation, not between two kinds of element. Averaging each group
-# to one axis removes it and leaves axes that name themselves.
+# splits separate `n_tss_midpoints` from `tss_avg_signal`, which carry a quarter
+# of the score each; that is a split between two ways of measuring initiation,
+# not between two kinds of element. Averaging each group to one axis removes it
+# and leaves axes that name themselves.
 #
 # The cut-offs are applied directly rather than through k-means, so an element's
-# category depends only on its own two scores: the same element always lands in
-# the same category, whatever else is in the table.
+# category does not depend on a randomly seeded centroid search. It does still
+# depend on the cohort, because the axes are built from z-scores taken over the
+# elements present in the table.
 CATEGORY_ACTIVE = 0.35  # below this on both axes an element is inactive
 CATEGORY_STRONG = 1.0   # at or above this an element is strong on that axis
+
+CLIP_Z = 3.0  # ceiling on any single column's contribution to an axis
 
 # Display order, and the order `priority_group` numbers follow.
 CATEGORY_ORDER = [
@@ -110,6 +127,25 @@ CATEGORY_ORDER = [
 ]
 # Categories whose CRE or TSS evidence is strong enough to call a candidate.
 STRONG_CATEGORIES = ["enhancer & promoter", "promoter-only", "enhancer-only"]
+
+
+# --- METRIC COLUMN HELPERS ---
+
+def metric_columns_for(cells: list[str]) -> list[str]:
+    """Metric-major column list: every cell line's `# CRE midpoints` together,
+    then every `Mean CRE activity`, and so on, with the TSS pair last. The
+    heatmap draws columns in this order, so related columns stay adjacent
+    without relying on a clustering dendrogram."""
+    return (
+        [f"{metric} ({cell})" for metric in CRE_METRIC_SPECS for cell in cells]
+        + list(TSS_METRIC_SPECS)
+    )
+
+
+def available_cells(columns) -> list[str]:
+    """Cell lines the overlaps table carries, in the order it carries them."""
+    prefix = "cre_avg_signal ("
+    return [column[len(prefix):-1] for column in columns if column.startswith(prefix)]
 
 
 def split_metric(column: str) -> tuple[str, str | None]:
@@ -144,7 +180,7 @@ def metric_group_mask(columns: list[str]) -> np.ndarray:
     return np.array([split_metric(column)[0] in TSS_METRIC_SPECS for column in columns])
 
 
-def metric_group_weights(columns: list[str]) -> np.ndarray:
+def composite_weights(columns: list[str]) -> np.ndarray:
     """Per-column weights giving the CRE and TSS groups a fixed share each.
 
     Each group's weight is spread evenly over its columns, so adding cell lines
@@ -156,6 +192,18 @@ def metric_group_weights(columns: list[str]) -> np.ndarray:
         if group.any():
             weights[group] /= group.sum()
     return weights
+
+
+def axis_weights(columns: list[str]) -> np.ndarray:
+    """Weights over one group's columns for its typing axis, summing to one."""
+    weights = np.array([AXIS_WEIGHTS[split_metric(column)[0]] for column in columns], dtype=float)
+    total = weights.sum()
+    if total == 0:
+        raise ValueError(f"AXIS_WEIGHTS leaves every column of {columns} at zero weight")
+    return weights / total
+
+
+METRIC_COLUMNS = metric_columns_for(CLUSTERING_CELLS)
 
 
 def category_name(cre_score: float, tss_score: float) -> str:
@@ -171,88 +219,90 @@ def category_name(cre_score: float, tss_score: float) -> str:
     return "weak promoter" if tss_score > cre_score else "weak enhancer"
 
 
-def available_metric_columns(columns) -> list[str]:
-    """Every metric the overlaps table supports, CRE metrics once per cell line."""
-    prefix = "cre_avg_signal ("
-    cells = [column[len(prefix):-1] for column in columns if column.startswith(prefix)]
-    return [f"{metric} ({cell})" for metric in CRE_METRIC_SPECS for cell in cells] + list(TSS_METRIC_SPECS)
+# --- TYPING ---
 
-
-METRIC_LABELS = [metric_label(column) for column in METRIC_COLUMNS]
-METRIC_THRESH = [metric_threshold(column) for column in METRIC_COLUMNS]
-METRIC_WEIGHTS = metric_group_weights(METRIC_COLUMNS)
-
-
-def functional_profile_clustering(
+def functional_profile_typing(
     df: pl.DataFrame,
     metric_columns: list[str],
-    metric_labels: list[str],
-    metric_thresh: list[float],
-    metric_weights: np.ndarray,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Score, type and sort elements. Returns the annotated table and the
+    matching heatmap matrix, whose rows are in the same order.
+
+    Everything the scoring needs is derived from `metric_columns`, so the
+    caller cannot pass labels, thresholds and weights that disagree with it.
+    """
+    labels = [metric_label(column) for column in metric_columns]
+    thresholds = np.array([metric_threshold(column) for column in metric_columns])
 
     # --- 1. Data Preparation & Normalization ---
-    df_pd = df.to_pandas()
-
-    # Calculate standard Z-scores
-    scaler = StandardScaler()
-    scaled_data = scaler.fit_transform(df_pd[metric_columns])
+    # StandardScaler rather than a bare z-score: it leaves a zero-variance column
+    # at 0 instead of propagating NaN.
+    raw = df.select(metric_columns).to_numpy()
+    scaled_data = StandardScaler().fit_transform(raw)
 
     # --- 2. Incorporate Physical Thresholds & Handle Outliers ---
-    # Create a boolean mask of elements passing their physical baselines
-    thresh_matrix = np.array(metric_thresh)
-    activity_mask = df_pd[metric_columns].values >= thresh_matrix
-
-    # Apply logic: If below raw threshold, mute interest contribution to 0.0
-    effective_z = np.where(activity_mask, scaled_data, 0.0)
-
-    # Cap maximum Z-score contribution per column to prevent single-column outliers from dominating
-    clipped_z = np.clip(effective_z, 0, 3.0)
-
-    # Weight by metric group, then compute the robust composite interest score
-    composite_interest = (clipped_z * metric_weights).sum(axis=1)
+    # If below its raw threshold, mute a column's contribution to 0.0, then cap
+    # the maximum z-score per column so single-column outliers cannot dominate.
+    activity_mask = raw >= thresholds
+    clipped_z = np.clip(np.where(activity_mask, scaled_data, 0.0), 0, CLIP_Z)
 
     # --- 3. Type Elements on the CRE and TSS Axes ---
-    # The axes are the unweighted group means: they say what kind of element this
-    # is, while CRE_WEIGHT / TSS_WEIGHT say how much each kind counts towards the
-    # composite. Keeping the two separate lets the weighting change without
-    # redrawing the categories.
+    # The axes say what kind of element this is, while CRE_WEIGHT / TSS_WEIGHT say
+    # how much each kind counts towards the composite. Keeping the two separate
+    # lets the weighting change without redrawing the categories. Within a group
+    # the metrics are combined by AXIS_WEIGHTS rather than averaged flat, so the
+    # length-insensitive mean activity can be given more of the say.
+    #
+    # With flat AXIS_WEIGHTS the composite reduces exactly to
+    # `CRE_WEIGHT * cre_score + TSS_WEIGHT * tss_score`; it only carries
+    # independent information once a group's weights are made uneven.
     is_tss = metric_group_mask(metric_columns)
-    df_pd['cre_score'] = clipped_z[:, ~is_tss].mean(axis=1)
-    df_pd['tss_score'] = clipped_z[:, is_tss].mean(axis=1)
-    df_pd['composite_z_score'] = composite_interest
+    scores = {}
+    for name, group in (("cre_score", ~is_tss), ("tss_score", is_tss)):
+        group_columns = [column for column, keep in zip(metric_columns, group) if keep]
+        scores[name] = clipped_z[:, group] @ axis_weights(group_columns)
+    composite = (clipped_z * composite_weights(metric_columns)).sum(axis=1)
 
-    df_pd['cluster_label'] = [
-        category_name(cre, tss) for cre, tss in zip(df_pd['cre_score'], df_pd['tss_score'])
-    ]
-    df_pd['priority_group'] = [CATEGORY_ORDER.index(label) + 1 for label in df_pd['cluster_label']]
+    cluster_label = [category_name(cre, tss) for cre, tss in zip(scores["cre_score"], scores["tss_score"])]
 
     # --- 4. Sort Elements for Visualization ---
-    # Sort by category (in CATEGORY_ORDER), then by composite score (desc)
-    df_sorted = df_pd.sort_values(
-        by=['priority_group', 'composite_z_score'],
-        ascending=[True, False]
-    ).reset_index(drop=True)
+    # By category (in CATEGORY_ORDER), then by composite score (desc). The source
+    # row is the final key so that the many elements tied at a composite of zero
+    # keep a reproducible order.
+    typed = df.with_columns(
+        cre_score=pl.Series(scores["cre_score"]),
+        tss_score=pl.Series(scores["tss_score"]),
+        composite_z_score=pl.Series(composite),
+        cluster_label=pl.Series(cluster_label),
+        priority_group=pl.Series([CATEGORY_ORDER.index(label) + 1 for label in cluster_label]),
+        source_row=pl.Series(np.arange(df.height, dtype=np.uint32)),
+    ).sort(
+        ["priority_group", "composite_z_score", "source_row"],
+        descending=[False, True, False],
+    )
 
-    # Re-extract standard unclipped Z-scores for visualization so raw magnitudes remain visible on the plot
-    heatmap_data = scaler.transform(df_sorted[metric_columns])
-    df_heatmap = pl.DataFrame(heatmap_data, schema=metric_labels)
+    # Standard unclipped, unmuted z-scores for visualization, reordered to match,
+    # so raw magnitudes remain visible on the plot.
+    df_heatmap = pl.DataFrame(scaled_data[typed["source_row"].to_numpy()], schema=labels)
 
-    return pl.from_pandas(df_sorted), df_heatmap
+    return typed.drop("source_row"), df_heatmap
 
 
-if __name__ == "__main__":
+# --- LOADING ---
 
-    # 0. Load pre-processed overlap data
-    element_citations = pl.read_parquet(ELEMENT_CITATIONS)
+def load_element_overlaps() -> pl.DataFrame:
+    """Overlap metrics joined to the popularity, length and annotation columns."""
+    element_citations = pl.read_parquet(ELEMENT_CITATIONS).select(
+        ["element_type", "element_name", *POPULARITY_COLUMNS]
+    )
     element_lengths = (
         pl.read_parquet(ELEMENT_POSITIONS)
         .group_by(["element_type", "element_name"])
-        .agg(pl.col("length").median().cast(pl.Int64))
-        .rename({"length": "element_length"})
+        .agg(pl.col("length").median().cast(pl.Int64).alias("element_length"))
     )
     promoter_distance = pl.read_parquet(PROMOTER_DISTANCE).select(
-        ["element_type", "element_name", "promoter_distance_mean", "promoter_distance_median", "is_reference_element"]
+        ["element_type", "element_name", "promoter_distance_mean",
+         "promoter_distance_median", "is_reference_element"]
     )
     # Divergence from the element's MSA consensus, as a percentage. Stored in
     # percent rather than as a fraction because the values span four orders of
@@ -263,44 +313,49 @@ if __name__ == "__main__":
         (100.0 * (1.0 - pl.col("avg_identity"))).alias("sequence_diversity_pct"),
         pl.col("n_instances_unique").alias("n_sequence_variants"),
     ])
-    element_cre_overlap = (
-        pl.read_parquet(ELEMENT_OVERLAPS)
-        .join(element_citations[["element_type", "element_name", "n_plasmids", "n_citations"]], left_on=["type", "name"], right_on=["element_type", "element_name"], how="left")
-        .join(element_lengths, left_on=["type", "name"], right_on=["element_type", "element_name"], how="left")
-        .join(promoter_distance, left_on=["type", "name"], right_on=["element_type", "element_name"], how="left")
-        .join(sequence_diversity, left_on=["type", "name"], right_on=["element_type", "element_name"], how="left")
-        .with_columns(pl.max_horizontal("tss_fwd_avg_signal", "tss_rev_avg_signal").alias("tss_avg_signal"))
+
+    overlaps = pl.read_parquet(ELEMENT_OVERLAPS)
+    for table in (element_citations, element_lengths, promoter_distance, sequence_diversity):
+        overlaps = overlaps.join(
+            table, left_on=["type", "name"], right_on=["element_type", "element_name"], how="left"
+        )
+    return overlaps.with_columns(
+        pl.max_horizontal("tss_fwd_avg_signal", "tss_rev_avg_signal").alias("tss_avg_signal")
     )
 
-    # 1. Clustering
-    # Every available metric is kept in the frame so the written table carries all
-    # cell lines; METRIC_COLUMNS alone decides what the clustering actually sees.
-    ALL_METRIC_COLUMNS = available_metric_columns(element_cre_overlap.columns)
-    missing = [column for column in METRIC_COLUMNS if column not in ALL_METRIC_COLUMNS]
-    if missing:
-        raise KeyError(f"METRIC_COLUMNS absent from {ELEMENT_OVERLAPS.name}: {missing}")
 
-    print(f"Writing {len(ALL_METRIC_COLUMNS)} metrics, clustering on {len(METRIC_COLUMNS)}:")
-    for column, weight in zip(METRIC_COLUMNS, METRIC_WEIGHTS):
+if __name__ == "__main__":
+
+    # 0. Load pre-processed overlap data
+    element_cre_overlap = load_element_overlaps()
+
+    # 1. Typing
+    # Every available metric is kept in the frame so the written table carries all
+    # cell lines; metric_columns alone decides what the typing actually sees.
+    all_metric_columns = metric_columns_for(available_cells(element_cre_overlap.columns))
+    missing = [column for column in METRIC_COLUMNS if column not in all_metric_columns]
+    if missing:
+        raise KeyError(f"metric columns absent from {ELEMENT_OVERLAPS.name}: {missing}")
+
+    print(f"Writing {len(all_metric_columns)} metrics, typing on {len(METRIC_COLUMNS)}:")
+    for column, weight in zip(METRIC_COLUMNS, composite_weights(METRIC_COLUMNS)):
         print(f"  {column:44s} threshold {metric_threshold(column):.5f}   weight {weight:.4f}")
 
     df = (
         element_cre_overlap
         .filter(pl.col("element_length") >= CRE_LENGTH_THRESH)
-        [ID_COLUMNS + ALL_METRIC_COLUMNS + POPULARITY_COLUMNS + ANNOTATION_COLUMNS]
-        .with_columns(pl.col(col_name).fill_null(0) for col_name in ALL_METRIC_COLUMNS)
+        .select(ID_COLUMNS + all_metric_columns + POPULARITY_COLUMNS + ANNOTATION_COLUMNS)
+        .with_columns(pl.col(all_metric_columns).fill_null(0))
     )
-    df_clustered, df_heatmap = functional_profile_clustering(
-        df, METRIC_COLUMNS, METRIC_LABELS, METRIC_THRESH, METRIC_WEIGHTS
-    )
+    df_typed, df_heatmap = functional_profile_typing(df, METRIC_COLUMNS)
     df_heatmap.write_csv(OUT_CLUSTER_RAW_HEAT)
 
     # 2. Identify Cryptic CRE candidates
-    df_clustered = df_clustered.with_columns(
+    # The length filter above already applies, so it is not repeated here.
+    df_typed = df_typed.with_columns(
         is_cryptic_cre=(
             (~pl.col("type").is_in(["promoter", "enhancer"])) &
-            (pl.col("element_length") >= CRE_LENGTH_THRESH) &
             (pl.col("cluster_label").is_in(STRONG_CATEGORIES))
         )
     )
-    df_clustered.write_csv(OUT_CLUSTER_RAW)
+    df_typed.write_csv(OUT_CLUSTER_RAW)
