@@ -35,6 +35,13 @@ ANNOTATION_COLUMNS = [
     "sequence_diversity_pct", "n_sequence_variants",
 ]
 
+# Strand-resolved TSS coverage, read straight from `08_element_cre_overlap.py`.
+# These are predicted activity rather than context, so they are not annotations,
+# but they are not scored either: they exist only to build `tss_directionality`,
+# the way `element_length` exists to build `cre_block_size_bp`. Carried into the
+# written table so the descriptor can be checked against its inputs.
+TSS_STRAND_COLUMNS = ["fraction_tss_fwd_bp", "fraction_tss_rev_bp"]
+
 # --- METRIC REGISTRY ---
 # Entries are (description, heatmap label). The description is documentation
 # only; the heatmap label is kept short because it is drawn once per cell line
@@ -52,8 +59,18 @@ CRE_METRIC_SPECS = {
     "fraction_cre_bp": ("Fraction base pairs that are CRE", "Fraction CRE bp"),
     "cre_avg_signal": ("Average activity of CRE base pairs", "Mean CRE activity"),
 }
-# Unlike the CRE metrics these are not resolved per cell line: the overlaps table
-# carries a single TSS column pair, so the TSS axis has no cross-cell replication.
+# Unlike the CRE metrics these are not resolved per cell line. `08` does resolve
+# them by strand, and the loader collapses each pair before scoring: counts by
+# sum, activity by max. That is deliberate, not an oversight. Strand is not a
+# replicate dimension the way cell line is - of the 191 elements with any TSS,
+# 113 initiate in one direction only and just 22 are bidirectional - so averaging
+# the two strands would halve the score of every unidirectional promoter. Scoring
+# the six strand-resolved columns as a flat mean was tried and did exactly that:
+# elements reaching TSS-strong fell from 41 to 28, unidirectional elements reached
+# it at 12% against 32% for bidirectional ones, and the annotated-promoter recall
+# dropped. Summing counts and taking the stronger strand's activity asks "how much
+# initiation, in whichever direction", which is the question the axis is for. The
+# direction itself is kept, as `tss_directionality`.
 TSS_METRIC_SPECS = {
     "n_tss_midpoints": ("# TSS Midpoints per Feature Instance", "# TSS midpoints"),
     "tss_avg_signal": ("Average activity of TSS base pairs", "Mean TSS activity"),
@@ -137,8 +154,8 @@ CATEGORY_STRONG = 1.0   # at or above this an axis carries strong evidence
 CATEGORY_NAMES = {
     ("strong", "strong"): "enhancer & promoter",
     ("weak", "strong"): "promoter, weak enhancer",
-    ("strong", "weak"): "enhancer, weak promoter",
     ("none", "strong"): "promoter-only",
+    ("strong", "weak"): "enhancer, weak promoter",
     ("strong", "none"): "enhancer-only",
     ("weak", "weak"): "weak enhancer & promoter",
     ("none", "weak"): "weak promoter",
@@ -247,6 +264,11 @@ def axis_weights(columns: list[str]) -> np.ndarray:
 METRIC_COLUMNS = metric_columns_for(CLUSTERING_CELLS)
 
 
+# --- DESCRIPTORS ---
+# Reported alongside the scores, never typed on. Each captures a dimension the
+# group mean of its side averages away, and each would put something into the
+# taxonomy that does not belong there if promoted to an axis.
+
 def cre_block_size(metric_columns: list[str]) -> pl.Expr:
     """Mean length in base pairs of one CRE block inside the element.
 
@@ -275,6 +297,35 @@ def cre_block_size(metric_columns: list[str]) -> pl.Expr:
     total_bp = pl.sum_horizontal(columns_of("fraction_cre_bp", metric_columns)) * pl.col("element_length")
     block_size = pl.min_horizontal(total_bp / total_cres, pl.col("element_length"))
     return pl.when(total_cres > 0).then(block_size).otherwise(None)
+
+
+def tss_directionality() -> pl.Expr:
+    """Strand bias of initiation over the element: +1 sense, -1 antisense, 0 both.
+
+    `(fwd - rev) / (fwd + rev)` over TSS base-pair coverage. Built from coverage
+    rather than counts or activity because all three agree closely (Spearman
+    0.93-0.95) and coverage is defined for the most elements - 191 against 171
+    for the counts. This is the quantity the strand collapse in the loader
+    discards, and it is what separates a unidirectional promoter from a
+    bidirectional one.
+
+    The signed, normalised form is preferred over a `max / min` ratio. The two
+    carry the same magnitude - the ratio is exactly `(1 + |d|) / (1 - |d|)` - but
+    the ratio is infinite for the 97 of 191 elements that initiate on one strand
+    only, and it discards the sign. The sign is the informative part: by element
+    type the median runs +0.99 for annotated promoters, +0.93 for introns, +0.74
+    for LTRs, -0.51 for CDS and -1.00 for origins of replication, and it places
+    both Pol III promoters (U6 -1.00, H1 -0.95) and the polyadenylation signals
+    (SV40 -0.93, bGH -0.87) on the antisense side.
+
+    A descriptor rather than an axis: orientation says what kind of initiation an
+    element drives, not how much, and the categories are about how much.
+
+    Undefined where neither strand has any TSS coverage.
+    """
+    fwd, rev = (pl.col(column) for column in TSS_STRAND_COLUMNS)
+    total = fwd + rev
+    return pl.when(total > 0).then((fwd - rev) / total).otherwise(None)
 
 
 def axis_band(score: float) -> str:
@@ -345,6 +396,7 @@ def functional_profile_typing(
         tss_score=pl.Series(scores["tss_score"]),
         composite_z_score=pl.Series(composite),
         cre_block_size_bp=cre_block_size(metric_columns),
+        tss_directionality=tss_directionality(),
         cluster_label=pl.Series(cluster_label),
         priority_group=pl.Series([CATEGORY_ORDER.index(label) + 1 for label in cluster_label]),
         source_row=pl.Series(np.arange(df.height, dtype=np.uint32)),
@@ -396,6 +448,13 @@ def load_element_overlaps() -> pl.DataFrame:
     ])
 
     overlaps = pl.read_parquet(ELEMENT_OVERLAPS)
+    absent = [column for column in TSS_STRAND_COLUMNS if column not in overlaps.columns]
+    if absent:
+        raise KeyError(
+            f"{ELEMENT_OVERLAPS.name} lacks the strand-resolved TSS coverage columns "
+            f"{absent} that `tss_directionality` is built from"
+        )
+
     for table in (element_citations, element_lengths, promoter_distance, sequence_diversity):
         overlaps = overlaps.join(
             table, left_on=["type", "name"], right_on=["element_type", "element_name"], how="left"
@@ -425,7 +484,8 @@ if __name__ == "__main__":
     df = (
         element_cre_overlap
         .filter(pl.col("element_length") >= CRE_LENGTH_THRESH)
-        .select(ID_COLUMNS + all_metric_columns + POPULARITY_COLUMNS + ANNOTATION_COLUMNS)
+        .select(ID_COLUMNS + all_metric_columns + POPULARITY_COLUMNS
+                + ANNOTATION_COLUMNS + TSS_STRAND_COLUMNS)
         # Only the count and coverage metrics: a null there means the element was
         # absent from a join and zero is the right reading. The conditional
         # columns keep their nulls, which is what `standardise` expects, and the
