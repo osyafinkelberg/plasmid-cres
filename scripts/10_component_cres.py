@@ -14,15 +14,17 @@ ELEMENT_CITATIONS = ADDGENE_DIR / "citations_addgene_elements.parquet"
 PROMOTER_DISTANCE = ADDGENE_DIR / "mammalian_plasmids_element_promoter_distance.parquet"
 ELEMENT_DIVERGENCE = ALIGN_DIR / "element_average_divergence.parquet"
 
-# Written to their own files so a gated run is not overwritten.
 OUT_CLUSTER_RAW = ADDGENE_DIR / "element_cre_overlap_clustering.csv"
 OUT_CLUSTER_RAW_HEAT = ADDGENE_DIR / "element_cre_overlap_clustering_heatmap.csv"
 
 ID_COLUMNS = ["type", "name", "element_length"]
-# Repeated on the heatmap table so it can be joined to the clustering table by
-# key instead of by row position.
-HEATMAP_KEY_COLUMNS = ["type", "name"]
 POPULARITY_COLUMNS = ["n_plasmids", "n_citations"]
+
+# Repeated on the heatmap table so it can be joined to the clustering table by
+# key rather than by row position: a heatmap file that is stale with respect to
+# its clustering file is otherwise indistinguishable from a fresh one, and
+# mis-annotates every row silently.
+HEATMAP_KEY_COLUMNS = ["type", "name"]
 
 # Carried through to the written table so the heatmap can annotate its rows with
 # them, but deliberately kept out of the metric columns: they describe an
@@ -39,13 +41,12 @@ ANNOTATION_COLUMNS = [
 # as a rotated tick label, where the full description would repeat six times and
 # swamp the figure.
 #
-# No metric carries a calling threshold in this variant of the script: a column
-# contributes on its standardised value alone. Because each column is
-# standardised separately, the ~2.2x difference in CREST activity scale between
-# cell lines (GM12878 1.05 vs SHSY5Y 2.35 at FDR 0.01) is absorbed by the
-# z-score rather than by a per-cell threshold. What is lost is the absolute
-# floor: an element now scores on a column for being active relative to the
-# cohort, whether or not it would be called a CRE there.
+# No metric carries a calling threshold. A column contributes on its
+# standardised value alone, and because each column is standardised separately
+# the ~2.2x difference in CREST activity scale between cell lines (GM12878 1.05
+# vs SHSY5Y 2.35 at FDR 0.01) is absorbed by the z-score. What that trades away
+# is an absolute floor: an element scores on a column for being active relative
+# to the cohort, whether or not it would be called a CRE there.
 CRE_METRIC_SPECS = {
     "n_cre_midpoints": ("# CRE Midpoints per Feature Instance", "# CRE midpoints"),
     "fraction_cre_bp": ("Fraction base pairs that are CRE", "Fraction CRE bp"),
@@ -97,15 +98,15 @@ AXIS_WEIGHTS = {
     "tss_avg_signal": 1.0,
 }
 
-# --- CLUSTERING ---
-# Every metric is computed for every cell line the overlaps table carries and
-# written to OUT_CLUSTER_RAW. Only the cell lines listed here shape the
-# categories and the heatmap.
-
-# CLUSTERING_CELLS = ["GM12878", "Jurkat", "MRC5", "A549", "HEK293T", "K562", "SHSY5Y", "SiHa"]
+# --- SCOPE ---
+# Cell lines the categories are built from. The overlaps table also carries
+# Jurkat and SiHa; every cell line it carries is written to OUT_CLUSTER_RAW, but
+# only these shape the axes and the heatmap.
 CLUSTERING_CELLS = ["GM12878", "MRC5", "A549", "HEK293T", "K562", "SHSY5Y"]
 
 CRE_LENGTH_THRESH = 100
+
+CLIP_Z = 3.0  # ceiling on any single column's contribution to an axis
 
 # Resolved at the bottom of the module, once the helpers below are defined. The
 # heatmap's own column labels are its header row, so nothing else needs exporting.
@@ -114,32 +115,46 @@ METRIC_COLUMNS: list[str]
 # --- CATEGORIES ---
 # Elements are typed in the plane of the CRE and TSS halves of the composite
 # score - the two quantities the composite is already built from - rather than
-# clustered in the 20 metric columns. In the full column space the strongest
-# splits separate `n_tss_midpoints` from `tss_avg_signal`, which carry a quarter
-# of the score each; that is a split between two ways of measuring initiation,
-# not between two kinds of element. Averaging each group to one axis removes it
-# and leaves axes that name themselves.
+# clustered in the 20 metric columns. There is no cluster structure there to
+# find: over the active elements k-means silhouette peaks at 0.39 for k=2 and
+# falls monotonically from there, so any choice of k would impose an arbitrary
+# partition and reintroduce a seed dependence that direct cut-offs avoid.
 #
-# The cut-offs are applied directly rather than through k-means, so an element's
-# category does not depend on a randomly seeded centroid search. It does still
-# depend on the cohort, because the axes are built from z-scores taken over the
-# elements present in the table.
-CATEGORY_ACTIVE = 0.35  # below this on both axes an element is inactive
-CATEGORY_STRONG = 1.0   # at or above this an element is strong on that axis
+# The two cut-offs divide each axis into none / weak / strong, and the nine
+# resulting cells are the categories. Naming all nine rather than collapsing them
+# into six removes the one arbitrary step the earlier scheme had: a
+# `tss_score > cre_score` tie-break that split the elements weak on both axes
+# between "weak promoter" and "weak enhancer" by comparing an 18-column mean
+# against a 2-column mean. A category now follows only from which band each of an
+# element's two scores falls in. It does still depend on the cohort, because the
+# axes are built from z-scores taken over the elements present in the table.
+CATEGORY_ACTIVE = 0.35  # below this an axis carries no evidence
+CATEGORY_STRONG = 1.0   # at or above this an axis carries strong evidence
 
-CLIP_Z = 3.0  # ceiling on any single column's contribution to an axis
+# Keyed by (CRE band, TSS band), in display order, which is the order
+# `priority_group` numbers follow: strongest single band first, then total
+# evidence, with TSS-leaning cells ahead of their CRE-leaning mirrors.
+CATEGORY_NAMES = {
+    ("strong", "strong"): "enhancer & promoter",
+    ("weak", "strong"): "promoter, weak enhancer",
+    ("strong", "weak"): "enhancer, weak promoter",
+    ("none", "strong"): "promoter-only",
+    ("strong", "none"): "enhancer-only",
+    ("weak", "weak"): "weak enhancer & promoter",
+    ("none", "weak"): "weak promoter",
+    ("weak", "none"): "weak enhancer",
+    ("none", "none"): "inactive",
+}
+CATEGORY_ORDER = list(CATEGORY_NAMES.values())
+# Categories with strong evidence on at least one axis: enough to call a candidate.
+STRONG_CATEGORIES = [name for bands, name in CATEGORY_NAMES.items() if "strong" in bands]
 
-# Display order, and the order `priority_group` numbers follow.
-CATEGORY_ORDER = [
-    "enhancer & promoter",
-    "promoter-only",
-    "enhancer-only",
-    "weak promoter",
-    "weak enhancer",
-    "inactive",
-]
-# Categories whose CRE or TSS evidence is strong enough to call a candidate.
-STRONG_CATEGORIES = ["enhancer & promoter", "promoter-only", "enhancer-only"]
+# Row order within a category, as (column, descending). `composite_z_score` puts
+# the strongest elements at the top of each band. `cre_block_size_bp` instead
+# lays the architecture gradient out down the figure - a few long CRE blocks at
+# one end, many short ones at the other - which is the structure that otherwise
+# reads as an unresolved split inside the enhancer-like categories.
+SORT_WITHIN_CATEGORY = ("cre_block_size_bp", True)  # ("composite_z_score", True)
 
 
 # --- METRIC COLUMN HELPERS ---
@@ -180,12 +195,18 @@ def is_conditional(column: str) -> bool:
     return split_metric(column)[0] in CONDITIONAL_METRICS
 
 
+def columns_of(metric: str, metric_columns: list[str]) -> list[str]:
+    """Every column of `metric_columns` that measures the given base metric."""
+    return [column for column in metric_columns if split_metric(column)[0] == metric]
+
+
 def standardise(values: np.ndarray) -> np.ndarray:
     """Column z-scores computed over the observed entries only.
 
-    Replaces `StandardScaler`, which rejects missing values. A column with no
-    spread is left at zero rather than producing NaN, and a column with nothing
-    observed is an error rather than a silently empty one.
+    Missing entries stay missing, so a column that is defined for only some
+    elements is centred on the elements that have a value. A column with no
+    spread is left at zero rather than yielding NaN, and a column with nothing
+    observed at all is an error rather than a silently empty one.
     """
     observed = np.count_nonzero(~np.isnan(values), axis=0)
     if (observed == 0).any():
@@ -226,17 +247,46 @@ def axis_weights(columns: list[str]) -> np.ndarray:
 METRIC_COLUMNS = metric_columns_for(CLUSTERING_CELLS)
 
 
+def cre_block_size(metric_columns: list[str]) -> pl.Expr:
+    """Mean length in base pairs of one CRE block inside the element.
+
+    Total CRE base pairs per instance over total CREs per instance, pooled across
+    the cell lines being typed. This describes an element's CRE architecture - a
+    few long blocks, or many short ones - which is a different question from how
+    much CRE there is, and is why it is reported rather than typed on. The raw
+    contrast it derives from, mean z(# midpoints) against mean z(fraction bp),
+    separates the enhancer-like categories into two visible halves but tracks
+    element length at rho 0.88, so promoting it to an axis would put length into
+    the taxonomy. This ratio removes that dependence, tracking length at +0.08
+    while still ordering the categories sensibly (median 295 bp for
+    `enhancer & promoter`, 188 bp for `enhancer-only`, 167 bp for `weak enhancer`).
+
+    Capped at the element's own length, because the two terms are counted over
+    different spans: coverage is clipped to the element, while a CRE is counted
+    only where its midpoint falls inside. An element sitting wholly within a
+    larger CRE therefore has coverage but few or no midpoints, and the bare ratio
+    runs away - it exceeded the element's own length for 85 of 341 elements
+    before capping, and reached 67 kb. At the cap the value means "no smaller
+    than this element", which is the most the table can say.
+
+    Undefined where no cell line calls a CRE anywhere in the element.
+    """
+    total_cres = pl.sum_horizontal(columns_of("n_cre_midpoints", metric_columns))
+    total_bp = pl.sum_horizontal(columns_of("fraction_cre_bp", metric_columns)) * pl.col("element_length")
+    block_size = pl.min_horizontal(total_bp / total_cres, pl.col("element_length"))
+    return pl.when(total_cres > 0).then(block_size).otherwise(None)
+
+
+def axis_band(score: float) -> str:
+    """Which of the three evidence bands a single axis score falls in."""
+    if score >= CATEGORY_STRONG:
+        return "strong"
+    return "weak" if score >= CATEGORY_ACTIVE else "none"
+
+
 def category_name(cre_score: float, tss_score: float) -> str:
-    """Name an element from where it sits on the CRE and TSS axes."""
-    if cre_score < CATEGORY_ACTIVE and tss_score < CATEGORY_ACTIVE:
-        return "inactive"
-    if cre_score >= CATEGORY_STRONG and tss_score >= CATEGORY_STRONG:
-        return "enhancer & promoter"
-    if tss_score >= CATEGORY_STRONG:
-        return "promoter-only"
-    if cre_score >= CATEGORY_STRONG:
-        return "enhancer-only"
-    return "weak promoter" if tss_score > cre_score else "weak enhancer"
+    """Name an element from the band each of its two axis scores falls in."""
+    return CATEGORY_NAMES[(axis_band(cre_score), axis_band(tss_score))]
 
 
 # --- TYPING ---
@@ -286,30 +336,29 @@ def functional_profile_typing(
     cluster_label = [category_name(cre, tss) for cre, tss in zip(scores["cre_score"], scores["tss_score"])]
 
     # --- 4. Sort Elements for Visualization ---
-    # By category (in CATEGORY_ORDER), then by composite score (desc). The source
+    # By category (in CATEGORY_ORDER), then by SORT_WITHIN_CATEGORY. The source
     # row is the final key so that the many elements tied at a composite of zero
     # keep a reproducible order.
+    sort_column, sort_descending = SORT_WITHIN_CATEGORY
     typed = df.with_columns(
         cre_score=pl.Series(scores["cre_score"]),
         tss_score=pl.Series(scores["tss_score"]),
         composite_z_score=pl.Series(composite),
+        cre_block_size_bp=cre_block_size(metric_columns),
         cluster_label=pl.Series(cluster_label),
         priority_group=pl.Series([CATEGORY_ORDER.index(label) + 1 for label in cluster_label]),
         source_row=pl.Series(np.arange(df.height, dtype=np.uint32)),
     ).sort(
-        ["priority_group", "composite_z_score", "source_row"],
-        descending=[False, True, False],
+        ["priority_group", sort_column, "source_row"],
+        descending=[False, sort_descending, False],
+        nulls_last=True,
     )
     order = typed["source_row"].to_numpy()
 
     # Standard unclipped z-scores for visualization, reordered to match, so raw
     # magnitudes remain visible on the plot. Conditional columns stay empty where
     # the element has no CRE or TSS, so the figure can draw "none called" as a
-    # blank cell (matplotlib `cmap.set_bad`) instead of as a strong negative. The key columns are carried so the
-    # two tables can be joined on `(type, name)` rather than on row position: a
-    # heatmap file that is stale with respect to its clustering file is otherwise
-    # indistinguishable from a fresh one, and mis-annotates every row silently.
-    # A plotting script takes the matrix as `df_heatmap.drop(HEATMAP_KEY_COLUMNS)`.
+    # blank cell (matplotlib `cmap.set_bad`) instead of as a strong negative.
     typed = typed.drop("source_row")
     df_heatmap = pl.concat(
         [typed.select(HEATMAP_KEY_COLUMNS),
@@ -363,7 +412,7 @@ if __name__ == "__main__":
 
     # 1. Typing
     # Every available metric is kept in the frame so the written table carries all
-    # cell lines; metric_columns alone decides what the typing actually sees.
+    # cell lines; METRIC_COLUMNS alone decides what the typing actually sees.
     all_metric_columns = metric_columns_for(available_cells(element_cre_overlap.columns))
     missing = [column for column in METRIC_COLUMNS if column not in all_metric_columns]
     if missing:
