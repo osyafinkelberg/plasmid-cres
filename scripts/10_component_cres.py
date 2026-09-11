@@ -14,8 +14,9 @@ ELEMENT_OVERLAPS = ADDGENE_DIR / "mammalian_plasmids_element_cre_overlaps.parque
 ELEMENT_CITATIONS = ADDGENE_DIR / "citations_addgene_elements.parquet"
 PROMOTER_DISTANCE = ADDGENE_DIR / "mammalian_plasmids_element_promoter_distance.parquet"
 ELEMENT_DIVERGENCE = ALIGN_DIR / "element_average_divergence.parquet"
-CREST_THRESHOLDS = PROJECT_DIR.parent / "mpra-predictor/data/cre_thresholds_fdr_001.csv"
 
+# Written to their own files so a gated run is not overwritten. Drop the
+# `_nogate` suffixes to make this a drop-in replacement.
 OUT_CLUSTER_RAW = ADDGENE_DIR / "element_cre_overlap_clustering.csv"
 OUT_CLUSTER_RAW_HEAT = ADDGENE_DIR / "element_cre_overlap_clustering_heatmap.csv"
 
@@ -32,32 +33,28 @@ ANNOTATION_COLUMNS = [
 ]
 
 # --- METRIC REGISTRY ---
-# `cre_avg_signal` deliberately carries no fixed threshold. CREST activity scales
-# differ by ~2.2x between cell lines (GM12878 1.05 vs SHSY5Y 2.35 at FDR 0.01),
-# so one shared constant would be far too strict for the former and too lenient
-# for the latter. It is instead derived per cell line as the strict CRE-calling
-# threshold used in `07_cre_annotation.py`
-PER_CELL_THRESHOLD = None
-
-# Entries are (description, heatmap label, threshold). The heatmap label is kept
-# short because it is drawn once per cell line as a rotated tick label, where the
-# full description would repeat six times and swamp the figure.
+# Entries are (description, heatmap label). The description is documentation
+# only; the heatmap label is kept short because it is drawn once per cell line
+# as a rotated tick label, where the full description would repeat six times and
+# swamp the figure.
+#
+# No metric carries a calling threshold in this variant of the script: a column
+# contributes on its standardised value alone. Because each column is
+# standardised separately, the ~2.2x difference in CREST activity scale between
+# cell lines (GM12878 1.05 vs SHSY5Y 2.35 at FDR 0.01) is absorbed by the
+# z-score rather than by a per-cell threshold. What is lost is the absolute
+# floor: an element now scores on a column for being active relative to the
+# cohort, whether or not it would be called a CRE there.
 CRE_METRIC_SPECS = {
-    "n_cre_midpoints": ("# CRE Midpoints per Feature Instance", "# CRE midpoints", 0.25),
-    "fraction_cre_bp": ("Fraction base pairs that are CRE", "Fraction CRE bp", 0.1),
-    "cre_avg_signal": ("Average activity of CRE base pairs", "Mean CRE activity", PER_CELL_THRESHOLD),
+    "n_cre_midpoints": ("# CRE Midpoints per Feature Instance", "# CRE midpoints"),
+    "fraction_cre_bp": ("Fraction base pairs that are CRE", "Fraction CRE bp"),
+    "cre_avg_signal": ("Average activity of CRE base pairs", "Mean CRE activity"),
 }
 # Unlike the CRE metrics these are not resolved per cell line: the overlaps table
 # carries a single TSS column pair, so the TSS axis has no cross-cell replication.
 TSS_METRIC_SPECS = {
-    "n_tss_midpoints": ("# TSS Midpoints per Feature Instance", "# TSS midpoints", 0.25),
-    "tss_avg_signal": ("Average activity of TSS base pairs", "Mean TSS activity", 0.1),
-}
-
-CRE_SIGNAL_THRESH_SCALE = 1.15  # strict thresholding, as in 07_cre_annotation.py
-CRE_SIGNAL_THRESH = {
-    row["cell"]: row["threshold"] * CRE_SIGNAL_THRESH_SCALE
-    for row in pl.read_csv(CREST_THRESHOLDS).iter_rows(named=True)
+    "n_tss_midpoints": ("# TSS Midpoints per Feature Instance", "# TSS midpoints"),
+    "tss_avg_signal": ("Average activity of TSS base pairs", "Mean TSS activity"),
 }
 
 # Share of the composite score each metric group carries. The CRE side gains a
@@ -162,19 +159,6 @@ def metric_label(column: str) -> str:
     return f"{CRE_METRIC_SPECS[base][1]} [{cell}]"
 
 
-def metric_threshold(column: str) -> float:
-    """Physical activity threshold a metric column must clear to count as active."""
-    base, cell = split_metric(column)
-    if base in TSS_METRIC_SPECS:
-        return TSS_METRIC_SPECS[base][2]
-    threshold = CRE_METRIC_SPECS[base][2]
-    if threshold is not PER_CELL_THRESHOLD:
-        return threshold
-    if cell is None:
-        raise ValueError(f"'{column}' needs a cell line to resolve its threshold")
-    return CRE_SIGNAL_THRESH[cell]
-
-
 def metric_group_mask(columns: list[str]) -> np.ndarray:
     """True where a metric column belongs to the TSS group, False for the CRE group."""
     return np.array([split_metric(column)[0] in TSS_METRIC_SPECS for column in columns])
@@ -229,10 +213,9 @@ def functional_profile_typing(
     matching heatmap matrix, whose rows are in the same order.
 
     Everything the scoring needs is derived from `metric_columns`, so the
-    caller cannot pass labels, thresholds and weights that disagree with it.
+    caller cannot pass labels and weights that disagree with it.
     """
     labels = [metric_label(column) for column in metric_columns]
-    thresholds = np.array([metric_threshold(column) for column in metric_columns])
 
     # --- 1. Data Preparation & Normalization ---
     # StandardScaler rather than a bare z-score: it leaves a zero-variance column
@@ -240,11 +223,11 @@ def functional_profile_typing(
     raw = df.select(metric_columns).to_numpy()
     scaled_data = StandardScaler().fit_transform(raw)
 
-    # --- 2. Incorporate Physical Thresholds & Handle Outliers ---
-    # If below its raw threshold, mute a column's contribution to 0.0, then cap
-    # the maximum z-score per column so single-column outliers cannot dominate.
-    activity_mask = raw >= thresholds
-    clipped_z = np.clip(np.where(activity_mask, scaled_data, 0.0), 0, CLIP_Z)
+    # --- 2. Handle Outliers ---
+    # Floor at zero so that below-average behaviour is absent evidence rather
+    # than evidence against, and cap the maximum z-score per column so single-
+    # column outliers cannot dominate.
+    clipped_z = np.clip(scaled_data, 0, CLIP_Z)
 
     # --- 3. Type Elements on the CRE and TSS Axes ---
     # The axes say what kind of element this is, while CRE_WEIGHT / TSS_WEIGHT say
@@ -339,7 +322,7 @@ if __name__ == "__main__":
 
     print(f"Writing {len(all_metric_columns)} metrics, typing on {len(METRIC_COLUMNS)}:")
     for column, weight in zip(METRIC_COLUMNS, composite_weights(METRIC_COLUMNS)):
-        print(f"  {column:44s} threshold {metric_threshold(column):.5f}   weight {weight:.4f}")
+        print(f"  {column:44s} weight {weight:.4f}")
 
     df = (
         element_cre_overlap
