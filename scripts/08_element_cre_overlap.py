@@ -88,6 +88,22 @@ def safe_nanmean(arr: np.ndarray, idxs: np.ndarray, metric: str) -> float:
     return float(np.nanmean(subset))
 
 
+def owned_peak_indices(peaks: list[set], mids: list[int], window: set) -> np.ndarray:
+    """Positions inside `window` belonging to the TSS peaks the window owns.
+
+    A peak is owned when its midpoint falls in the window - the same test the
+    midpoint counts use - so an element cannot report activity or coverage for a
+    peak it did not count. Clipping a neighbouring peak's shoulder contributes
+    nothing: without this, an element that catches the tail of a wide peak takes
+    that peak's height while counting no midpoint at all.
+    """
+    owned = [peak for peak, mid in zip(peaks, mids) if mid in window]
+    if not owned:
+        return np.array([], dtype=int)
+
+    return np.fromiter(set.union(*owned) & window, dtype=int)
+
+
 def calculate_overlap_statistics(elements_path: Path, output_path: Path) -> None:
     # 1. Load Datasets
     elements_df = pl.read_parquet(elements_path)
@@ -172,8 +188,8 @@ def calculate_overlap_statistics(elements_path: Path, output_path: Path) -> None
                 "cre_idx_set": [set(get_interval_indices(iv, L)) for iv in cre_iv],
                 "fwd_mids_int": np.floor(get_midpoints(fwd_iv, L)).astype(int).tolist(),
                 "rev_mids_int": np.floor(get_midpoints(rev_iv, L)).astype(int).tolist(),
-                "fwd_idx_set": set(get_interval_indices(fwd_iv, L)),
-                "rev_idx_set": set(get_interval_indices(rev_iv, L)),
+                "fwd_peak_idx": [set(get_interval_indices([interval], L)) for interval in fwd_iv],
+                "rev_peak_idx": [set(get_interval_indices([interval], L)) for interval in rev_iv],
             }
 
         update_every = 25_000
@@ -247,8 +263,8 @@ def calculate_overlap_statistics(elements_path: Path, output_path: Path) -> None
                 mids_fwd = sd["rev_mids_int"]
                 mids_rev = sd["fwd_mids_int"]
 
-                full_fwd_set = sd["rev_idx_set"]
-                full_rev_set = sd["fwd_idx_set"]
+                peaks_fwd = sd["rev_peak_idx"]
+                peaks_rev = sd["fwd_peak_idx"]
             else:
                 feat_downstream_idx = genomic_right
                 feat_upstream_idx = genomic_left
@@ -259,8 +275,8 @@ def calculate_overlap_statistics(elements_path: Path, output_path: Path) -> None
                 mids_fwd = sd["fwd_mids_int"]
                 mids_rev = sd["rev_mids_int"]
 
-                full_fwd_set = sd["fwd_idx_set"]
-                full_rev_set = sd["rev_idx_set"]
+                peaks_fwd = sd["fwd_peak_idx"]
+                peaks_rev = sd["rev_peak_idx"]
 
             # --- Calculate Sets ---
             body_set = set(body_idx)
@@ -273,9 +289,9 @@ def calculate_overlap_statistics(elements_path: Path, output_path: Path) -> None
             tss_fwd_hits = sum(1 for m in mids_fwd if m in fwd_set)
             tss_rev_hits = sum(1 for m in mids_rev if m in rev_set)
 
-            # --- Calculate Signals & Fractions (Based on full interval intersections) ---
-            tss_fwd_overlap_idx = np.array(list(full_fwd_set & fwd_set), dtype=int)
-            tss_rev_overlap_idx = np.array(list(full_rev_set & rev_set), dtype=int)
+            # --- Calculate Signals & Fractions (Based on the peaks the counts owned) ---
+            tss_fwd_overlap_idx = owned_peak_indices(peaks_fwd, mids_fwd, fwd_set)
+            tss_rev_overlap_idx = owned_peak_indices(peaks_rev, mids_rev, rev_set)
 
             # Signal extraction: peak, not mean. A TSS is a point event, so
             # averaging over every TSS-called bp in the element dilutes a sharp
