@@ -70,14 +70,20 @@ def get_interval_indices(intervals: list, L: int) -> np.ndarray:
     return np.unique(np.array(indices) % L)
 
 
-def safe_nanmean(arr: np.ndarray, idxs: np.ndarray) -> float:
-    """Safely calculates nanmean, returning np.nan if array is empty or all NaNs."""
+def safe_nanmean(arr: np.ndarray, idxs: np.ndarray, metric: str) -> float:
+    """Safely reduces `arr` over `idxs`, returning np.nan if empty or all NaNs.
+
+    `metric="mean"` averages the overlap, `metric="max"` takes its peak.
+    """
     if len(idxs) == 0:
         return np.nan
 
     subset = arr[idxs]
     if np.isnan(subset).all():
         return np.nan
+
+    if metric == "max":
+        return float(np.nanmax(subset))
 
     return float(np.nanmean(subset))
 
@@ -129,7 +135,7 @@ def calculate_overlap_statistics(elements_path: Path, output_path: Path) -> None
         """Metric block for an element whose body maps to zero base pairs."""
         record = {
             "tss_hits": 0, "tss_fwd_hits": 0, "tss_rev_hits": 0,
-            "tss_fwd_avg_signal": np.nan, "tss_rev_avg_signal": np.nan,
+            "tss_fwd_max_signal": np.nan, "tss_rev_max_signal": np.nan,
             "fraction_tss_fwd_bp": 0.0, "fraction_tss_rev_bp": 0.0,
         }
         for cell in cells:
@@ -267,13 +273,15 @@ def calculate_overlap_statistics(elements_path: Path, output_path: Path) -> None
             tss_fwd_hits = sum(1 for m in mids_fwd if m in fwd_set)
             tss_rev_hits = sum(1 for m in mids_rev if m in rev_set)
 
-            # --- Calculate Averages & Fractions (Based on full interval intersections) ---
+            # --- Calculate Signals & Fractions (Based on full interval intersections) ---
             tss_fwd_overlap_idx = np.array(list(full_fwd_set & fwd_set), dtype=int)
             tss_rev_overlap_idx = np.array(list(full_rev_set & rev_set), dtype=int)
 
-            # Signal extraction 
-            tss_fwd_avg_signal = safe_nanmean(signal_fwd, tss_fwd_overlap_idx)
-            tss_rev_avg_signal = safe_nanmean(signal_rev, tss_rev_overlap_idx)
+            # Signal extraction: peak, not mean. A TSS is a point event, so
+            # averaging over every TSS-called bp in the element dilutes a sharp
+            # initiation site in proportion to how much TSS sequence surrounds it.
+            tss_fwd_max_signal = safe_nanmean(signal_fwd, tss_fwd_overlap_idx, metric="max")
+            tss_rev_max_signal = safe_nanmean(signal_rev, tss_rev_overlap_idx, metric="max")
 
             # Fraction calculations
             len_body = len(body_idx)
@@ -289,8 +297,8 @@ def calculate_overlap_statistics(elements_path: Path, output_path: Path) -> None
                 "tss_hits": tss_fwd_hits + tss_rev_hits,
                 "tss_fwd_hits": tss_fwd_hits,
                 "tss_rev_hits": tss_rev_hits,
-                "tss_fwd_avg_signal": tss_fwd_avg_signal,
-                "tss_rev_avg_signal": tss_rev_avg_signal,
+                "tss_fwd_max_signal": tss_fwd_max_signal,
+                "tss_rev_max_signal": tss_rev_max_signal,
                 "fraction_tss_fwd_bp": frac_tss_fwd,
                 "fraction_tss_rev_bp": frac_tss_rev,
             }
@@ -299,7 +307,7 @@ def calculate_overlap_statistics(elements_path: Path, output_path: Path) -> None
             for cell_idx, cell in enumerate(cells):
                 cre_overlap_idx = np.array(list(sd["cre_idx_set"][cell_idx] & body_set), dtype=int)
                 record[cre_column("cre_hits", cell)] = sum(1 for m in sd["cre_mids_int"][cell_idx] if m in body_set)
-                record[cre_column("cre_avg_signal", cell)] = safe_nanmean(sd["crest_signals"][cell_idx], cre_overlap_idx)
+                record[cre_column("cre_avg_signal", cell)] = safe_nanmean(sd["crest_signals"][cell_idx], cre_overlap_idx, metric="mean")
                 record[cre_column("fraction_cre_bp", cell)] = len(cre_overlap_idx) / len_body
 
             overlap_records.append(record)
@@ -316,8 +324,8 @@ def calculate_overlap_statistics(elements_path: Path, output_path: Path) -> None
             pl.col("tss_fwd_hits").mean().alias("n_tss_fwd_midpoints"),
             pl.col("tss_rev_hits").mean().alias("n_tss_rev_midpoints"),
 
-            pl.col("tss_fwd_avg_signal").drop_nans().mean().alias("tss_fwd_avg_signal"),
-            pl.col("tss_rev_avg_signal").drop_nans().mean().alias("tss_rev_avg_signal"),
+            pl.col("tss_fwd_max_signal").drop_nans().mean().alias("tss_fwd_max_signal"),
+            pl.col("tss_rev_max_signal").drop_nans().mean().alias("tss_rev_max_signal"),
 
             pl.col("fraction_tss_fwd_bp").mean().alias("fraction_tss_fwd_bp"),
             pl.col("fraction_tss_rev_bp").mean().alias("fraction_tss_rev_bp"),
