@@ -70,6 +70,34 @@ def get_interval_indices(intervals: list, L: int) -> np.ndarray:
     return np.unique(np.array(indices) % L)
 
 
+def circular_bounds(intervals: list, L: int) -> tuple[int, int]:
+    """Start and end of an element body on the circular plasmid, as [start, end).
+
+    Parts are merged and the widest gap between them is taken as the outside of
+    the element, as `04_addgene_msa.py` does. The stored interval order cannot be
+    used instead: Biopython lists minus-strand joins 5' to 3', so the first part's
+    start and the last part's end mark an internal junction, not the two ends.
+    """
+    parts = []
+    for s, e in intervals:
+        if s > e:  # wraps the origin
+            parts.extend([(s, L), (0, e)])
+        else:
+            parts.append((s, e))
+    parts.sort()
+
+    merged = [parts[0]]
+    for s, e in parts[1:]:
+        if s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+
+    gaps = [(merged[(i + 1) % len(merged)][0] - merged[i][1]) % L for i in range(len(merged))]
+    widest = int(np.argmax(gaps))
+    return merged[(widest + 1) % len(merged)][0] % L, merged[widest][1] % L
+
+
 def safe_nanmean(arr: np.ndarray, idxs: np.ndarray, metric: str) -> float:
     """Safely reduces `arr` over `idxs`, returning np.nan if empty or all NaNs.
 
@@ -243,8 +271,9 @@ def calculate_overlap_statistics(elements_path: Path, output_path: Path) -> None
                 overlap_records.append({"type": out_type, "name": out_name, **empty_metrics()})
                 continue
 
-            genomic_start = body_indices[0] % L
-            genomic_end = (body_indices[-1] + 1) % L
+            # True ends, not the stored order: for a minus-strand join that order puts
+            # both TSS flanks at an internal junction, inside the body.
+            genomic_start, genomic_end = circular_bounds(element_intervals, L)
 
             genomic_left = np.arange(genomic_start - TSS_FLANK_SIZE, genomic_start) % L
             genomic_right = np.arange(genomic_end, genomic_end + TSS_FLANK_SIZE) % L

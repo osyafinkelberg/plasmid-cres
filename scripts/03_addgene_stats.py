@@ -484,6 +484,34 @@ def circular_gap(
     return np.where(overlaps, 0.0, np.minimum(forward, backward).astype(float))
 
 
+def circular_bounds(intervals: list, L: int) -> tuple[int, int]:
+    """Start and end of an element body on the circular plasmid, as [start, end).
+
+    Parts are merged and the widest gap between them is taken as the outside of
+    the element, as `04_addgene_msa.py` does. The stored interval order cannot be
+    used instead: Biopython lists minus-strand joins 5' to 3', so the first part's
+    start and the last part's end mark an internal junction, not the two ends.
+    """
+    parts = []
+    for s, e in intervals:
+        if s > e:  # wraps the origin
+            parts.extend([(s, L), (0, e)])
+        else:
+            parts.append((s, e))
+    parts.sort()
+
+    merged = [parts[0]]
+    for s, e in parts[1:]:
+        if s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+
+    gaps = [(merged[(i + 1) % len(merged)][0] - merged[i][1]) % L for i in range(len(merged))]
+    widest = int(np.argmax(gaps))
+    return merged[(widest + 1) % len(merged)][0] % L, merged[widest][1] % L
+
+
 def calculate_promoter_proximity(elements_path: Path, output_path: Path) -> None:
     """Distance from every element to the nearest mammalian Pol II promoter.
 
@@ -503,13 +531,9 @@ def calculate_promoter_proximity(elements_path: Path, output_path: Path) -> None
         pl.read_parquet(PLASMID_STATS_OUT).select(["gbk_name", "plasmid_length"]).iter_rows()
     )
 
-    # Body span per instance, matching the convention used elsewhere for
-    # multi-interval features: first interval's start through last one's end.
     elements = (
         pl.read_parquet(elements_path)
         .with_columns(
-            body_start=pl.col("intervals").list.first().list.first(),
-            body_stop=pl.col("intervals").list.last().list.last(),
             is_reference=pl.struct(["element_type", "element_name"]).map_elements(
                 lambda row: (row["element_type"], row["element_name"]) in reference_elements,
                 return_dtype=pl.Boolean,
@@ -525,9 +549,13 @@ def calculate_promoter_proximity(elements_path: Path, output_path: Path) -> None
         if length is None:
             continue
 
-        starts = plasmid["body_start"].to_numpy()
+        # Body span per instance from its true circular bounds. The stored interval
+        # order gives a minus-strand join a zero-length span, which the line below
+        # would then stretch over the whole plasmid, placing it on every promoter.
+        bounds = [circular_bounds(intervals, length) for intervals in plasmid["intervals"].to_list()]
+        starts = np.array([start for start, _ in bounds])
         # A body ending exactly where it starts spans the whole plasmid, not nothing.
-        spans = (plasmid["body_stop"].to_numpy() - starts) % length
+        spans = (np.array([end for _, end in bounds]) - starts) % length
         spans[spans == 0] = length
         is_reference = plasmid["is_reference"].to_numpy()
 
