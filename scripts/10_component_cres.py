@@ -98,9 +98,9 @@ CATEGORY_STRONG = 1.0   # at or above this an axis carries strong evidence
 # STRONG_CATEGORIES is a membership test, so it is unaffected.
 CATEGORY_NAMES = {
     ("strong", "strong"): "enhancer & promoter",
+    ("strong", "weak"): "enhancer, weak promoter",
     ("weak", "strong"): "promoter, weak enhancer",
     ("none", "strong"): "promoter-only",
-    ("strong", "weak"): "enhancer, weak promoter",
     ("weak", "weak"): "weak enhancer & promoter",
     ("strong", "none"): "enhancer-only",
     ("none", "weak"): "weak promoter",
