@@ -491,6 +491,6 @@ def extract_representative_sequence_relative_cre_overlaps(output_path: Path) -> 
 
 
 if __name__ == "__main__":
-    calculate_overlap_statistics(ELEMENT_FILE, ELEMENT_OVERLAPS_OUT, ELEMENT_ORIENTATION)  # 20 min, 8 cell lines
-    calculate_overlap_statistics(PRIMERS_FILE, PRIMERS_OVERLAPS_OUT)  # 11 min, 8 cell lines
+    calculate_overlap_statistics(ELEMENT_FILE, ELEMENT_OVERLAPS_OUT, ELEMENT_ORIENTATION)  # 10 min, 8 cell lines
+    calculate_overlap_statistics(PRIMERS_FILE, PRIMERS_OVERLAPS_OUT)  # 7 min, 8 cell lines
     extract_representative_sequence_relative_cre_overlaps(REPR_SEQ_OVERLAPS)  # 2 sec

@@ -917,6 +917,6 @@ if __name__ == "__main__":
     extract_subtypes_to_fasta()  # 30 sec
     assign_sequence_orientation()  # 30 sec
     extract_cds_aa_to_fasta()  # 30 sec
-    make_and_analyze_msa()  # 17 min from scratch; only reoriented elements realign
-    make_and_analyze_msa_cds()  # 4 min (Gold-6242 CPU)
-    get_representative_sequence(plasmid_citations, REPRESENT_FLANK_SIZE)  # 8 min
+    make_and_analyze_msa()  # 9.5 min from scratch; only reoriented elements realign
+    make_and_analyze_msa_cds()  # 1.5 min
+    get_representative_sequence(plasmid_citations, REPRESENT_FLANK_SIZE)  # 3.5 min

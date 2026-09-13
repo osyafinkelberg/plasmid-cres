@@ -343,4 +343,4 @@ def calculate_instance_overlap_statistics() -> None:
 
 
 if __name__ == "__main__":
-    calculate_instance_overlap_statistics()  # 9 min
+    calculate_instance_overlap_statistics()  # 4.5 min
