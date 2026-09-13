@@ -1,9 +1,11 @@
+import functools
 import re
 import typing as tp
 from pathlib import Path
 
 import h5py
 import numpy as np
+import polars as pl
 from Bio import SeqIO
 from PIL import Image
 
@@ -14,14 +16,35 @@ PUFFIN_KEYS = [
     'FANTOM_CAGE_rev', 'ENCODE_CAGE_rev', 'ENCODE_RAMPAGE_rev', 'GRO_CAP_rev', 'PRO_CAP_rev'
 ]
 
+# Feature types Addgene's GenBank files never write with `complement()`: 0 of
+# 82,168 polyA_signal, 71,740 misc_feature, 43,832 enhancer, 32,807 LTR, 27,504
+# regulatory and 11,838 repeat_region features carry one, and intron has 1 of
+# 18,504. Biopython reads a location without `complement()` as the plus strand, so
+# on these types a strand of +1 records no direction at all and an element sitting
+# reversed on a plasmid still reads forward. `04_addgene_msa.py` assigns their
+# orientation from sequence instead. 5'UTR is left out: 12 of its 207 features are
+# written with `complement()`, so it does carry a direction.
+DIRECTION_FREE_TYPES = frozenset({
+    "3'UTR", "LTR", "RBS", "enhancer", "exon", "gap", "intron", "misc_feature",
+    "misc_recomb", "misc_signal", "mobile_element", "oriT", "polyA_signal",
+    "regulatory", "repeat_region",
+})
+
 # Version of the pile-up groups `save_aligned_predictions_h5` writes. Bump it when
 # the extraction changes what a stored group means, so stale groups are rebuilt
 # rather than reused. 2: signal tracks share the type matrix's element bounds, and
-# TSS masks are resolved on the element's own strand.
-PILEUP_FORMAT = 2
+# TSS masks are resolved on the element's own strand. 3: direction-free types take
+# their strand from sequence, so rows are drawn in the element's own orientation.
+PILEUP_FORMAT = 3
+
+# Labels whose recurring SnapGene notes mark different sequences, written by
+# `build_note_splits` in `03_addgene_stats.py`. Rebuild it after downloading new
+# GenBank files: a note it has not seen falls back to the bare label.
+NOTE_SPLITS = Path(__file__).resolve().parents[1] / "data/addgene/element_name_splits.csv"
 
 
-def extract_feature_name(feat) -> str:
+def base_feature_name(feat) -> str:
+    """The feature's label: the first of `label`, `gene`, `note` and `product`."""
     name = None
     for key in ['label', 'gene', 'note', 'product']:
         if key in feat.qualifiers:
@@ -32,6 +55,38 @@ def extract_feature_name(feat) -> str:
         name = "unknown"
 
     return name
+
+
+def feature_note(feat) -> str:
+    """SnapGene's description of the feature, whitespace-normalised; '' when absent."""
+    return " ".join(feat.qualifiers.get("note", [""])[0].split())
+
+
+@functools.cache
+def note_splits() -> dict[tuple[str, str, str], str]:
+    """`(element_type, label, note)` -> `element_name`, read from NOTE_SPLITS."""
+    if not NOTE_SPLITS.exists():
+        raise FileNotFoundError(
+            f"{NOTE_SPLITS} is missing; build it with `build_note_splits` in `03_addgene_stats.py`"
+        )
+    table = pl.read_csv(NOTE_SPLITS, infer_schema_length=0, missing_utf8_is_empty_string=True)
+    return {
+        (element_type, label, note): element_name
+        for element_type, label, note, element_name
+        in table.select(["element_type", "label", "note", "element_name"]).iter_rows()
+    }
+
+
+def extract_feature_name(feat) -> str:
+    """Element name of a GenBank feature.
+
+    The feature's label, qualified by its SnapGene note where one label covers
+    different sequences - `chimeric intron` is four unrelated introns, named apart
+    as e.g. `chimeric intron [chimera introns from chicken beta-actin rabbit]`.
+    Every other label is returned unchanged.
+    """
+    label = base_feature_name(feat)
+    return note_splits().get((feat.type, label, feature_note(feat)), label)
 
 
 def extract_genbank_record_by_name(input_file: Path, record_name: str, output_file: Path) -> bool:
@@ -153,6 +208,54 @@ def load_representative_sequences(fasta_path: Path | str) -> dict[tuple[str, str
         } 
 
     return representative_map
+
+
+def load_oriented_elements(elements_path: Path | str, orientation_path: Path | str) -> pl.DataFrame:
+    """The element table, with direction-free strands taken from sequence.
+
+    For instances of `DIRECTION_FREE_TYPES` that `04_addgene_msa.py` oriented,
+    `strand` becomes the GenBank strand times that sequence orientation. The
+    orientation is relative to sequences extracted strand-aware, so the product is
+    what places the rare instance these types do write with `complement()` (an
+    intron and a 3'UTR); every other one is annotated +1 and simply takes the
+    orientation. The GenBank value is kept as `annotated_strand`, and
+    `orientation_source` says which of the two each row uses. Annotated types keep their strand, as do features below the
+    25 bp extraction threshold (`regulatory` and `RBS` are ~10 bp) and any variant
+    too diverged to place.
+
+    Row order is preserved: `08_element_cre_overlap.py` walks the table expecting a
+    plasmid's elements to be contiguous.
+    """
+    elements = pl.read_parquet(elements_path)
+    key = ["gbk_name", "element_type", "element_name", "intervals"]
+    orientation = pl.read_parquet(orientation_path).select([*key, "sequence_orientation"])
+
+    oriented = (
+        elements.join(orientation, on=key, how="left", maintain_order="left")
+        .with_columns(
+            from_sequence=(
+                pl.col("element_type").is_in(list(DIRECTION_FREE_TYPES))
+                & pl.col("sequence_orientation").is_not_null()
+            )
+        )
+        .with_columns(
+            annotated_strand=pl.col("strand"),
+            strand=pl.when(pl.col("from_sequence"))
+                     .then(pl.col("strand") * pl.col("sequence_orientation"))
+                     .otherwise(pl.col("strand")),
+            orientation_source=pl.when(pl.col("from_sequence"))
+                                 .then(pl.lit("sequence"))
+                                 .otherwise(pl.lit("annotation")),
+        )
+        .drop(["sequence_orientation", "from_sequence"])
+    )
+
+    if oriented.height != elements.height:
+        raise ValueError(
+            f"the orientation table duplicated element rows: {elements.height} -> {oriented.height}"
+        )
+
+    return oriented
 
 
 def sanitize_filename(name: str) -> str:

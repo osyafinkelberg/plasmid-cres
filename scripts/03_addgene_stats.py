@@ -1,10 +1,17 @@
+import re
+import sys
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np
 import polars as pl
 from Bio import SeqIO
+from Bio.Align import PairwiseAligner
 from Bio.Seq import Seq
 from tqdm import tqdm
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from plasmidtools import helpers
 
 # --- CONFIGURATION ---
 CUR_DIR = Path(__file__).resolve()
@@ -26,18 +33,120 @@ MIN_ORF_NUC_LENGTH = 300
 MIN_INS_NUC_LENTHS = 150
 COMMON_MARKERS = ["puro", "bsd", "zeo", "neo", "hygro", "gfp", "yfp", "cfp", "mcherry", "luciferase"]
 
+# Splitting labels by SnapGene note (`build_note_splits`)
+MIN_NOTE_PLASMIDS = 5         # a note must recur to define an element of its own
+SPLIT_KMER = 12               # as ORIENTATION_KMER in `04_addgene_msa.py`
+MIN_SHARED_KMERS = 0.8        # share of the shorter sequence's k-mers, either orientation
+MIN_LENGTH_RATIO = 0.9        # a shorter variant below this ratio is its own element
+MIN_PROTEIN_IDENTITY = 0.9    # CDS: codon variants of one protein stay one element
+MAX_TAG_WORDS = 6
 
-def extract_feature_name(feat) -> str:
-    name = None
-    for key in ['label', 'gene', 'note', 'product']:
-        if key in feat.qualifiers:
-            name = feat.qualifiers[key][0]
-            break
+PROTEIN_ALIGNER = PairwiseAligner(mode="global", open_gap_score=-1, extend_gap_score=-0.5)
 
-    if not name:
-        name = "unknown"
 
-    return name
+def kmer_share(query: str, target: str) -> float:
+    """Share of the query's k-mers found in the target, in its better orientation."""
+    query_kmers = {query[i:i + SPLIT_KMER] for i in range(len(query) - SPLIT_KMER + 1)}
+    reverse = str(Seq(target).reverse_complement())
+    shared = max(
+        len(query_kmers & {s[i:i + SPLIT_KMER] for i in range(len(s) - SPLIT_KMER + 1)})
+        for s in (target, reverse)
+    )
+    return shared / max(len(query_kmers), 1)
+
+
+def same_element(element_type: str, seq_a: str, seq_b: str) -> bool:
+    """Whether two note groups' representative sequences are one element.
+
+    CDS are compared as proteins, so codon-optimised versions stay together; other
+    types by shared k-mers and length, so a truncated or deletion variant (SV40
+    promoter without its enhancer) is split off rather than absorbed.
+    """
+    if element_type == "CDS":
+        a, b = (str(Seq(s[: len(s) // 3 * 3]).translate()).rstrip("*") for s in (seq_a, seq_b))
+        identities = PROTEIN_ALIGNER.align(a, b)[0].counts().identities
+        return identities / max(len(a), len(b), 1) >= MIN_PROTEIN_IDENTITY
+    short, long = sorted((seq_a, seq_b), key=len)
+    return kmer_share(short, long) >= MIN_SHARED_KMERS and len(short) / len(long) >= MIN_LENGTH_RATIO
+
+
+def distinguishing_tags(notes: list[str], lengths: list[int]) -> list[str]:
+    """Words of each note that not every other note shares; the length where none are."""
+    words = [re.findall(r"[\w\-/+.']+", note) for note in notes]
+    shared = set.intersection(*map(set, words))
+    tags = [" ".join([w for w in ws if w not in shared][:MAX_TAG_WORDS]) for ws in words]
+    return [tag if tag and tags.count(tag) == 1 else f"{length} bp" for tag, length in zip(tags, lengths)]
+
+
+def build_note_splits(gbk_path: Path = COMBINED_GBK, output_path: Path = helpers.NOTE_SPLITS) -> pl.DataFrame:
+    """Write the table `helpers.extract_feature_name` uses to split mixed labels.
+
+    Addgene's files are SnapGene exports, where a feature's `/note` is the feature
+    database's description of it: one label can cover several database entries
+    (`chimeric intron` covers four unrelated introns), told apart only by the note.
+    A label is split when it carries two or more notes recurring in at least
+    MIN_NOTE_PLASMIDS plasmids whose most common sequences are not the same element.
+    Rare notes join the group whose sequence they most resemble, so every note seen
+    in the files has a row. Rerun after downloading new GenBank files.
+    """
+    sequences = defaultdict(Counter)  # (type, label, note) -> sequence counts
+    plasmids = defaultdict(set)
+    for record in tqdm(SeqIO.parse(gbk_path, "genbank"), total=N_PLASMIDS, desc="Scanning feature notes"):
+        for feat in record.features:
+            if feat.type in ("source", "primer_bind"):
+                continue
+            key = (feat.type, helpers.base_feature_name(feat), helpers.feature_note(feat))
+            sequences[key][str(feat.extract(record.seq)).upper()] += 1
+            plasmids[key].add(record.name)
+
+    notes_by_label = defaultdict(list)
+    for element_type, label, note in sequences:
+        notes_by_label[(element_type, label)].append(note)
+
+    rows = []
+    for (element_type, label), notes in notes_by_label.items():
+        usage = {note: len(plasmids[(element_type, label, note)]) for note in notes}
+        recurrent = sorted((n for n in notes if usage[n] >= MIN_NOTE_PLASMIDS), key=lambda n: -usage[n])
+        if len(recurrent) < 2:
+            continue
+        representative = {note: sequences[(element_type, label, note)].most_common(1)[0][0] for note in notes}
+
+        # Single linkage over recurring notes: a note joins, and so merges, every
+        # group holding a note it is the same element as.
+        groups: list[list[str]] = []
+        for note in recurrent:
+            matched = [g for g in groups if any(same_element(element_type, representative[note], representative[m]) for m in g)]
+            groups = [g for g in groups if g not in matched] + [[note, *(m for g in matched for m in g)]]
+        if len(groups) < 2:
+            continue
+
+        groups = [sorted(g, key=lambda n: -usage[n]) for g in groups]
+        for note in notes:
+            if usage[note] < MIN_NOTE_PLASMIDS:
+                max(groups, key=lambda g: kmer_share(representative[note], representative[g[0]])).append(note)
+
+        tags = distinguishing_tags([g[0] for g in groups], [len(representative[g[0]]) for g in groups])
+        for group, tag in zip(groups, tags):
+            for note in group:
+                rows.append({
+                    "element_type": element_type, "label": label, "note": note,
+                    "element_name": f"{label} [{tag}]",
+                    "n_plasmids": usage[note], "representative_length": len(representative[note]),
+                })
+
+    schema = {
+        "element_type": pl.String, "label": pl.String, "note": pl.String,
+        "element_name": pl.String, "n_plasmids": pl.Int64, "representative_length": pl.Int64,
+    }
+    table = pl.DataFrame(rows, schema=schema).sort(["element_type", "label", "n_plasmids"], descending=[False, False, True])
+    table.write_csv(output_path)
+    helpers.note_splits.cache_clear()  # names looked up before this rebuild are stale
+
+    print(
+        f"Split {table.select(['element_type', 'label']).n_unique()} labels into "
+        f"{table['element_name'].n_unique()} element names; saved to {output_path}"
+    )
+    return table
 
 
 def is_insert_match(feat_name: str, expected_inserts: list) -> bool:
@@ -143,11 +252,12 @@ def collect_plasmid_element_data(
             if feat.type in ['source', 'primer_bind']: 
                 continue  # primers are ignored for structural mask building
 
-            name = extract_feature_name(feat)
+            name = helpers.extract_feature_name(feat)
             intervals = [(int(p.start), int(p.end)) for p in feat.location.parts]
 
-            # check if this feature is actually an insert
-            if is_insert_match(name, insert_names):
+            # check if this feature is actually an insert. Matched on the bare label:
+            # the bracketed note of a split name would stop it matching insert names.
+            if is_insert_match(helpers.base_feature_name(feat), insert_names):
                 ins_back_state = "insert"
             else:
                 ins_back_state = "backbone"
@@ -289,7 +399,7 @@ def collect_primer_data() -> None:
         # extract and map the primer_bind features
         for feat in record.features:
             if feat.type == 'primer_bind':
-                name = extract_feature_name(feat)
+                name = helpers.extract_feature_name(feat)
                 intervals = [(int(p.start), int(p.end)) for p in feat.location.parts]
 
                 # compute nucleotide index set for the primer
@@ -596,6 +706,9 @@ if __name__ == "__main__":
         row["sequence_id"]: row["inserts"].split(" ||| ") if row["inserts"] else [] for row in plasmid_download.iter_rows(named=True)
     }
     N_PLASMIDS = plasmid_download.filter(pl.col("download_status") == "200").height
+
+    # # 0. Element name splits read by `helpers.extract_feature_name` (rerun after a new download)
+    build_note_splits()  # ~30 s
 
     # # 1.
     collect_plasmid_element_data(expected_inserts, MIN_INS_NUC_LENTHS, MIN_ORF_NUC_LENGTH)
