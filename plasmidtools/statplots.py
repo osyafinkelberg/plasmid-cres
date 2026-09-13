@@ -610,6 +610,7 @@ def functional_profiling_plot(
 def combined_prediction_pileups(
     cre_matrix, fwd_matrix, rev_matrix, element_type, element_name, flank_size,
     percentile_bands=((5, 95, 0.15), (25, 75, 0.30)),
+    cre_label: str = f"CREST ({DEFAULT_CRE_CELL})",
 ) -> tuple[plt.Figure, tuple[plt.Axes, plt.Axes]]:
     """
     Plots aligned CREST and stranded Puffin tracks for a specific element.
@@ -644,9 +645,15 @@ def combined_prediction_pileups(
     for low, high, alpha in percentile_bands:
         ax1.fill_between(x_axis, cre_curves[low], cre_curves[high], color='gray', alpha=alpha, lw=0)
     ax1.plot(x_axis, np.nanmean(cre_matrix, axis=0), color='crimson', lw=2, label='CREST Mean')
-    ax1.set_ylabel("CREST (HEK293T)", fontweight='bold')
-    ax1.set_ylim([-1, 8.5])
-    ax1.legend(loc='upper right', frameon=False)
+    ax1.set_ylabel(cre_label, fontweight='bold', fontsize=FONT_SIZES["axis_label"])
+    # Limits widen to fit the data but never tighten below the range these panels
+    # have always shown, so pages stay comparable while strong elements stop being
+    # clipped - the fixed +-0.5 cut the CAGE panel off for half the stored pileups.
+    ax1.set_ylim([
+        min(-1.0, float(np.nanmin(cre_curves[min(levels)]))),
+        max(8.5, 1.05 * float(np.nanmax(cre_curves[max(levels)]))),
+    ])
+    ax1.legend(loc='upper right', frameon=False, fontsize=FONT_SIZES["legend"])
 
     # --- BOTTOM SUBPLOT: PUFFIN (Strand-Aware Mirror Plot) ---
     fwd_curves = percentile_curves(fwd_matrix)
@@ -664,9 +671,12 @@ def combined_prediction_pileups(
     # Baseline for mirror plot
     ax2.axhline(0, color='black', lw=1, alpha=0.5)
 
-    ax2.set_ylabel("Puffin CAGE (± Strand)", fontweight='bold')
-    ax2.set_ylim([-0.5, 0.5])
-    ax2.legend(loc='upper right', frameon=False)
+    ax2.set_ylabel("Puffin CAGE (± Strand)", fontweight='bold', fontsize=FONT_SIZES["axis_label"])
+    strand_peak = max(
+        float(np.nanmax(fwd_curves[max(levels)])), float(np.nanmax(rev_curves[max(levels)]))
+    )
+    ax2.set_ylim([-max(0.5, 1.1 * strand_peak), max(0.5, 1.1 * strand_peak)])
+    ax2.legend(loc='upper right', frameon=False, fontsize=FONT_SIZES["legend"])
 
     # --- GLOBAL FORMATTING ---
     for ax in [ax1, ax2]:
@@ -678,17 +688,53 @@ def combined_prediction_pileups(
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
         ax.grid(axis='y', alpha=0.1)
+        ax.tick_params(labelsize=FONT_SIZES["tick"])
 
-    ax2.set_xlabel("Distance from Element Start (bp)", fontweight='bold')
+    ax2.set_xlabel("Distance from Element Start (bp)", fontweight='bold', fontsize=FONT_SIZES["axis_label"])
 
     # band_text = ", ".join(f"{low}-{high}%" for low, high, _ in percentile_bands)
     fig.suptitle(
         f"Aligned Pileup Profile: {element_type} - {element_name}\n"
         f"(n={len(cre_matrix)} instances)",  # "; shaded bands: {band_text})",
-        fontsize=16, fontweight='bold', y=0.95,
+        fontsize=FONT_SIZES["title"], fontweight='bold', y=0.95,
     )
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     return fig, (ax1, ax2)
+
+
+def architecture_row_sample(n_rows: int, max_rows: int = 10000, seed: int = 0) -> np.ndarray:
+    """Which rows an architecture heatmap draws, as sorted row indices.
+
+    A seeded sample rather than the first `max_rows`: element instances are stored
+    in plasmid order, so the head of a common element is not a fair picture of it -
+    for `ori` the first 10,000 rows have a median sequence id of 236,343 against
+    354,799 across all 56,132.
+    """
+    if n_rows <= max_rows:
+        return np.arange(n_rows)
+
+    return np.sort(np.random.default_rng(seed).choice(n_rows, max_rows, replace=False))
+
+
+def architecture_row_order(type_matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Hamming row order and cluster ids for an already-sampled architecture matrix.
+
+    Exposed so a caller drawing several overlays of one architecture clusters once
+    instead of once per figure; the distance matrix is what these figures cost,
+    around 30 s at the 10,000-row cap.
+    """
+    if len(type_matrix) > 1:
+        # Avoid clustering failure if all elements are perfectly identical
+        dist_matrix = pdist(type_matrix, metric='hamming')
+        if np.any(dist_matrix):
+            row_linkage = linkage(dist_matrix, method='average')
+            row_order = leaves_list(row_linkage)
+            max_dist = row_linkage[:, 2].max()
+            cluster_labels = fcluster(row_linkage, t=0.5 * max_dist, criterion='distance')
+            return row_order, cluster_labels[row_order].reshape(-1, 1)
+
+    row_order = np.arange(len(type_matrix))
+    return row_order, np.ones((len(type_matrix), 1))
 
 
 def element_centered_architecture_heatmap(
@@ -698,7 +744,10 @@ def element_centered_architecture_heatmap(
     cre_matrix: np.ndarray = None,
     cre_label: str = "CRE Prediction",
     target_label: str = "Element of Interest",
-    max_rows: int = 10000
+    max_rows: int = 10000,
+    seed: int = 0,
+    row_order: np.ndarray = None,
+    row_clusters: np.ndarray = None
 ) -> tuple[plt.Figure, plt.Axes]:
     """
     Plots a publication-quality heatmap centered on instances of a specific feature.
@@ -714,22 +763,16 @@ def element_centered_architecture_heatmap(
     custom_cmap = ListedColormap(cmap_list)
 
     # 2. Downsample and Cluster Rows (Hamming distance)
-    matrix_to_cluster = type_matrix[:max_rows] if type_matrix.shape[0] > max_rows else type_matrix
-    if len(matrix_to_cluster) > 1:
-        # Avoid clustering failure if all elements are perfectly identical
-        dist_matrix = pdist(matrix_to_cluster, metric='hamming')
-        if np.any(dist_matrix):
-            row_linkage = linkage(dist_matrix, method='average')
-            row_order = leaves_list(row_linkage)
-            max_dist = row_linkage[:, 2].max()
-            cluster_labels = fcluster(row_linkage, t=0.5 * max_dist, criterion='distance')
-            ordered_clusters = cluster_labels[row_order].reshape(-1, 1)
-        else:
-            row_order = np.arange(len(matrix_to_cluster))
-            ordered_clusters = np.ones((len(matrix_to_cluster), 1))
+    # `row_order` / `row_clusters` may be precomputed by the caller from
+    # `architecture_row_order(type_matrix[architecture_row_sample(...)])`, which is
+    # the same sample this function takes for the same `max_rows` and `seed`.
+    n_rows = type_matrix.shape[0]
+    sampled_rows = architecture_row_sample(n_rows, max_rows, seed)
+    matrix_to_cluster = type_matrix[sampled_rows]
+    if row_order is None or row_clusters is None:
+        row_order, ordered_clusters = architecture_row_order(matrix_to_cluster)
     else:
-        row_order = np.arange(len(matrix_to_cluster))
-        ordered_clusters = np.ones((len(matrix_to_cluster), 1))
+        ordered_clusters = row_clusters
 
     # 3. Setup Layout GridSpec
     fig = plt.figure(figsize=(18, 12), dpi=300)
@@ -763,8 +806,7 @@ def element_centered_architecture_heatmap(
 
     # 4. ELEGANT OVERLAY: Masked Alpha Modulation
     if cre_matrix is not None:
-        cre_to_cluster = cre_matrix[:max_rows] if cre_matrix.shape[0] > max_rows else cre_matrix
-        cre_ordered = cre_to_cluster[row_order, :]
+        cre_ordered = cre_matrix[sampled_rows][row_order, :]
 
         # Create a masked array where positions WITHOUT a CRE prediction (0) are hidden
         masked_architecture = np.ma.masked_where(cre_ordered == 0, matrix_to_cluster[row_order, :])
@@ -794,11 +836,14 @@ def element_centered_architecture_heatmap(
     tick_labels = [f"-{flank_size} bp", "Start (0 bp)", f"End ({element_size} bp)", f"+{flank_size} bp"]
 
     ax.set_xticks(tick_positions)
-    ax.set_xticklabels(tick_labels, fontsize=11, fontweight='medium')
-    ax.set_xlabel(f"Localized Distance Coordinates Relative to {target_label}", fontweight='bold', fontsize=14, labelpad=12)
+    ax.set_xticklabels(tick_labels, fontsize=FONT_SIZES["tick"], fontweight='medium')
+    ax.set_xlabel(f"Localized Distance Coordinates Relative to {target_label}", fontweight='bold', fontsize=FONT_SIZES["axis_label"], labelpad=12)
     ax.set_yticks([])
 
-    ax.set_title(f"{target_label}, {cre_label} (n={len(matrix_to_cluster)})", fontweight='bold', fontsize=16, pad=25)
+    # Say what the sample is when one was taken, so a capped heatmap is not read
+    # as the whole cohort.
+    shown = f"n={len(matrix_to_cluster):,}" + (f" of {n_rows:,}" if n_rows > len(matrix_to_cluster) else "")
+    ax.set_title(f"{target_label}, {cre_label} ({shown})", fontweight='bold', fontsize=FONT_SIZES["title"], pad=25)
     
     # 7. Unified Legend Generation
     legend_elements = [Line2D([0], [0], color=cmap_list[0], lw=8, label='Backbone')]
@@ -818,10 +863,10 @@ def element_centered_architecture_heatmap(
     ax.legend(
         handles=legend_elements, 
         title="Map Features & Intensity", 
-        title_fontproperties={'weight': 'bold', 'size': 11},
+        title_fontproperties={'weight': 'bold', 'size': FONT_SIZES["legend_title"]},
         bbox_to_anchor=(1.01, 1), 
         loc='upper left', 
-        fontsize=10, 
+        fontsize=FONT_SIZES["legend"], 
         frameon=False
     )
 

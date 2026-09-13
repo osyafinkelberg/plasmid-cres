@@ -39,7 +39,7 @@ def derive_element_cre_activity(cre_matrix: np.ndarray, pred_matrix: np.ndarray,
     return np.nanmedian(row_sums)  # separates promoters better, than average per bp activity
 
 
-def calculate_crest_cell_specific_promoter_activity() -> None:
+def calculate_crest_cell_specific_promoter_activity(tracks: dict) -> None:
 
     strength_df = []
     for element_type, element_name in tqdm(promoters["element_type", "element_name"].rows()):
@@ -49,9 +49,10 @@ def calculate_crest_cell_specific_promoter_activity() -> None:
 
         matrix_metadata = pileups.get_matrix_metadata(plasmid_stats, element_positions, element_type, element_name)
 
+        # Same metadata as the CRE masks below, so signal and mask rows line up and
+        # share one coordinate frame.
         crest_matrix_dct, puff_fwd_matrix, puff_rev_matrix = pileups.extract_aligned_element_predictions(
-            ELEMENT_POSITIONS, CREST_TILE_ENCOD, CREST_TILE_PREDS, PUFFIN_PREDS,
-            element_type, element_name, TSS_FLANK_SIZE, cell_names=CREST_CELLS
+            matrix_metadata, element_size, TSS_FLANK_SIZE, cell_names=CREST_CELLS, tracks=tracks
         )
 
         row = {
@@ -88,4 +89,9 @@ if __name__ == "__main__":
     promoters = pl.read_csv(MANUAL_DIR / "addgene_promoters_and_enhancers.csv")
 
     # --- 2. Aggregated CRE activity ---
-    calculate_crest_cell_specific_promoter_activity()  # 85 min
+    # Tracks loaded once: rebuilt per element they took ~10 s each, plus a ~50 ms
+    # random Puffin read per instance, which is where the previous 85 min went.
+    tracks = pileups.load_prediction_tracks(
+        CREST_TILE_ENCOD, CREST_TILE_PREDS, PUFFIN_PREDS, cell_names=list(CREST_CELLS)
+    )
+    calculate_crest_cell_specific_promoter_activity(tracks)

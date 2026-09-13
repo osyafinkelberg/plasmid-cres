@@ -14,6 +14,12 @@ PUFFIN_KEYS = [
     'FANTOM_CAGE_rev', 'ENCODE_CAGE_rev', 'ENCODE_RAMPAGE_rev', 'GRO_CAP_rev', 'PRO_CAP_rev'
 ]
 
+# Version of the pile-up groups `save_aligned_predictions_h5` writes. Bump it when
+# the extraction changes what a stored group means, so stale groups are rebuilt
+# rather than reused. 2: signal tracks share the type matrix's element bounds, and
+# TSS masks are resolved on the element's own strand.
+PILEUP_FORMAT = 2
+
 
 def extract_feature_name(feat) -> str:
     name = None
@@ -162,7 +168,8 @@ def has_sufficient_flank(
 ) -> bool:
     """
     Checks if an element is already stored in the H5 file with an equal 
-    or greater flank size. Safe to run before heavy matrix computations.
+    or greater flank size, written in the current `PILEUP_FORMAT`. Safe to run
+    before heavy matrix computations.
     """
     if not Path(h5_path).exists():
         return False
@@ -170,7 +177,10 @@ def has_sufficient_flank(
     group_path = f"{sanitize_filename(element_type)}/{sanitize_filename(element_name)}"
     with h5py.File(h5_path, "r") as h5f:
         if group_path in h5f:
-            existing_flank = h5f[group_path].attrs.get("flank_size", -1)
+            group = h5f[group_path]
+            if int(group.attrs.get("pileup_format", 1)) != PILEUP_FORMAT:
+                return False
+            existing_flank = group.attrs.get("flank_size", -1)
             return existing_flank >= flank_size
 
     return False
@@ -201,7 +211,7 @@ def save_aligned_predictions_h5(
     group_path = f"{sanitize_filename(element_type)}/{sanitize_filename(element_name)}"
     with h5py.File(h5_path, "a") as h5f:
         if group_path in h5f:
-            print(f"Overwriting {group_path}: Updating to a larger flank_size ({flank_size}).")
+            print(f"Overwriting {group_path}: stored flank_size or pileup format is out of date.")
             del h5f[group_path]
         else:
             print(f"Saving {group_path}: New element with flank_size {flank_size}.")
@@ -209,6 +219,7 @@ def save_aligned_predictions_h5(
         group = h5f.create_group(group_path)
         group.attrs["element_size"] = element_size
         group.attrs["flank_size"] = flank_size
+        group.attrs["pileup_format"] = PILEUP_FORMAT
 
         # Apply GZIP compression chunks for efficient dense array storage
         group.create_dataset("type_matrix", data=type_matrix, compression="gzip", chunks=True)
@@ -253,6 +264,13 @@ def load_aligned_predictions_h5(
 
         element_size = int(group.attrs.get("element_size", -1))
         flank_size = int(group.attrs.get("flank_size", -1))
+
+        pileup_format = int(group.attrs.get("pileup_format", 1))
+        if pileup_format != PILEUP_FORMAT:
+            print(
+                f"Warning: {group_path} was written in pileup format {pileup_format}, not "
+                f"{PILEUP_FORMAT}; regenerate it with `15_element_pileups.py`."
+            )
 
         # Pull datasets entirely into memory as numpy arrays [:]
         type_matrix = group["type_matrix"][:]

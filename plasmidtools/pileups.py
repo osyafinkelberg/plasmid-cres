@@ -67,7 +67,12 @@ def get_matrix_metadata(
         else:
             actual_len = (L - genomic_start) + genomic_end
 
+        if actual_len == 0:
+            # A body ending exactly where it starts spans the whole plasmid, not nothing.
+            actual_len = L
+
         matrix_metadata.append({
+            "gbk_name": row["gbk_name"],
             "sequence_id": seq_id,
             "plasmid_len": L,
             "instance_start": genomic_start,
@@ -78,8 +83,9 @@ def get_matrix_metadata(
 
     # Strict schema ensures downstream matrix functions don't crash if 0 targets found
     schema = {
-        "sequence_id": pl.Int64, "plasmid_len": pl.Int64, "instance_start": pl.Int64, 
-        "instance_end": pl.Int64, "actual_len": pl.Int64, "strand": pl.Int64
+        "gbk_name": pl.String, "sequence_id": pl.Int64, "plasmid_len": pl.Int64,
+        "instance_start": pl.Int64, "instance_end": pl.Int64, "actual_len": pl.Int64,
+        "strand": pl.Int64
     }
     return pl.DataFrame(matrix_metadata, schema=schema) if matrix_metadata else pl.DataFrame(schema=schema)
 
@@ -260,133 +266,175 @@ def extract_regulatory_element_matrix(
         return np.zeros((0, total_window_width), dtype=np.int8)
 
 
-# SIGNALS PILEUP
-def extract_aligned_element_predictions(
-    element_positions_path: Path, crest_tile_encoding_path: Path,
-    crest_tile_preds_path: Path, puffin_preds_path: Path,
-    element_type: str, element_name: str, flank_size: int,
-    cell_names: list[str]
-) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray]:
+# PREDICTION TRACK STORE
+def load_prediction_tracks(
+    crest_tile_encoding_path: Path, crest_tile_preds_path: Path, puffin_preds_path: Path,
+    cell_names: list[str], gbk_names: set[str] | None = None
+) -> dict:
+    """CREST and Puffin CAGE tracks for every plasmid, read once.
+
+    Hand the result to `extract_aligned_element_predictions`. Building it per
+    element is what made the pileups slow: the CREST encoding was re-read and its
+    442M tile ids exploded for every element (~10 s each), every instance fetched
+    its tiles with a full-table filter (1.6 ms), and every instance pulled its
+    Puffin row out of the 15 GB file as a separate random read (~50 ms). Read in
+    file order once instead, the whole Puffin pass costs ~1.5 min and the two CAGE
+    tracks need ~3.5 GB.
+
+    `gbk_names` limits the Puffin tracks to the plasmids that will be asked for.
+    The CREST arrays are global and always loaded in full.
     """
-    Extracts and aligns CREST and Puffin predictions for a specific element.
-
-    Args:
-        element_positions_path: Path to the element positions file.
-        crest_tile_encoding_path: Path to the CREST tile encoding file.
-        crest_tile_preds_path: Path to the CREST tile predictions file.
-        puffin_preds_path: Path to the Puffin predictions file.
-        element_type: The type of the element (e.g., 'promoter', 'putative_orf').
-        element_name: The specific name of the element.
-        flank_size: Number of base pairs to include upstream and downstream.
-        cell_names: List of cell types to extract CREST predictions for.
-
-    Returns:
-        Tuple of (cre_matrices, fwd_tss_matrix, rev_tss_matrix). 
-        - cre_matrices is a dictionary mapping cell names to arrays of shape (N_instances, 2 * flank_size + median_element_length).
-        - fwd_tss_matrix and rev_tss_matrix are arrays of the same shape.
-    """
-    # 1. Load Element Metadata
-    plasmid_elements = pl.read_parquet(element_positions_path)
-    element_df = plasmid_elements.filter(
-        (pl.col("element_type") == element_type) & 
-        (pl.col("element_name") == element_name)
-    )
-
-    n_instances = element_df.height
-    if n_instances == 0:
-        raise ValueError(f"No instances found for {element_type}: {element_name}")
-
-    median_len = int(element_df["length"].median())
-    aligned_len = 2 * flank_size + median_len
-
-    # 2. Pre-load CREST global arrays for requested cells
     tile_encoding = pl.read_parquet(crest_tile_encoding_path)
     cre_predictions = pl.read_parquet(crest_tile_preds_path)
-    n_crest_tiles = tile_encoding["tile_ids"].explode().max() + 1
-    
+
+    n_crest_tiles = tile_encoding["tile_ids"].list.max().max() + 1
+    pred_tile_ids = cre_predictions["tile_ID"].to_numpy()
     cell_tile_preds = {}
     for cell in cell_names:
-        preds = np.full(n_crest_tiles, np.nan)
-        preds[cre_predictions["tile_ID"].to_numpy()] = cre_predictions[cell].to_numpy()
+        preds = np.full(n_crest_tiles, np.nan, dtype=np.float32)
+        preds[pred_tile_ids] = cre_predictions[cell].to_numpy()
         cell_tile_preds[cell] = preds
 
-    # 3. Initialize Output Matrices
-    cre_matrices = {cell: np.zeros((n_instances, aligned_len), dtype=np.float32) for cell in cell_names}
+    # optimization: a flat int32 tile-id array plus per-plasmid offsets, as
+    # `08_element_cre_overlap.py` does - the same ids as Python lists cost ~15 GB.
+    tile_ids_flat = tile_encoding["tile_ids"].explode().to_numpy().astype(np.int32)
+    offsets = np.concatenate(
+        ([0], np.cumsum(tile_encoding["tile_ids"].list.len().to_numpy().astype(np.int64)))
+    )
+    tile_span = {
+        gbk_name: (int(offsets[i]), int(offsets[i + 1]))
+        for i, gbk_name in enumerate(tile_encoding["gbk_name"].to_list())
+    }
+    del tile_encoding, cre_predictions
+
+    puffin_fwd, puffin_rev = {}, {}
+    with h5py.File(puffin_preds_path, "r") as h5f:
+        puffin_feat_names = h5f.attrs["features"]
+        fwd_idx = int(np.argwhere(puffin_feat_names == "FANTOM_CAGE fwd")[0, 0])
+        rev_idx = int(np.argwhere(puffin_feat_names == "FANTOM_CAGE rev")[0, 0])
+
+        stored = set(h5f.keys())
+        wanted = sorted(stored if gbk_names is None else stored & set(gbk_names))
+        for gbk_name in wanted:
+            tracks = h5f[gbk_name][[fwd_idx, rev_idx]]
+            puffin_fwd[gbk_name] = tracks[0]
+            puffin_rev[gbk_name] = tracks[1]
+
+    return {
+        "cell_tile_preds": cell_tile_preds,
+        "tile_ids_flat": tile_ids_flat,
+        "tile_span": tile_span,
+        "puffin_fwd": puffin_fwd,
+        "puffin_rev": puffin_rev,
+    }
+
+
+# SIGNALS PILEUP
+def extract_aligned_element_predictions(
+    matrix_metadata: pl.DataFrame, element_size: int, flank_size: int,
+    cell_names: list[str], tracks: dict
+) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray]:
+    """CREST and Puffin predictions aligned on one element, one row per instance.
+
+    Windows come from `matrix_metadata`, so these matrices share their rows and
+    their coordinate frame with the type and CRE / TSS matrices. Taking the element
+    ends from the stored interval order instead put both flanks at an internal
+    junction and swapped the two halves of the body, because Biopython lists
+    minus-strand joins 5' to 3'.
+
+    The stranded Puffin matrices are resolved on the element's own strand, the
+    convention `08_element_cre_overlap.py` uses.
+
+    Returns (cre_matrices, fwd_matrix, rev_matrix), each of shape
+    (N_instances, 2 * flank_size + element_size).
+    """
+    aligned_len = 2 * flank_size + element_size
+    n_instances = matrix_metadata.height
+    cre_matrices = {
+        cell: np.zeros((n_instances, aligned_len), dtype=np.float32) for cell in cell_names
+    }
     fwd_matrix = np.zeros((n_instances, aligned_len), dtype=np.float32)
     rev_matrix = np.zeros((n_instances, aligned_len), dtype=np.float32)
 
-    # 4. Iterate and Extract Predictions
-    with h5py.File(puffin_preds_path, "r") as h5f:
-        puffin_feat_names = h5f.attrs["features"]
-        puffin_fwd_idx = int(np.argwhere(puffin_feat_names == "FANTOM_CAGE fwd")[0, 0])
-        puffin_rev_idx = int(np.argwhere(puffin_feat_names == "FANTOM_CAGE rev")[0, 0])
+    x_new = np.linspace(0, 1, element_size)
+    missing = set()
 
-        for row_idx, row in enumerate(element_df.iter_rows(named=True)):
-            gbk_name = row["gbk_name"]
-            strand = row["strand"]
-            intervals = row["intervals"]
+    for row_idx, meta in enumerate(matrix_metadata.iter_rows(named=True)):
+        gbk_name = meta["gbk_name"]
+        if gbk_name not in tracks["puffin_fwd"] or gbk_name not in tracks["tile_span"]:
+            missing.add(gbk_name)  # row stays zero, so rows keep matching the metadata
+            continue
 
-            # Puffin
-            puffin_preds = h5f[gbk_name][:]
-            puffin_fwd = puffin_preds[puffin_fwd_idx]
-            puffin_rev = puffin_preds[puffin_rev_idx]
+        L = meta["plasmid_len"]
+        start, end = meta["instance_start"], meta["instance_end"]
+        actual_len, strand = meta["actual_len"], meta["strand"]
 
-            L = len(puffin_fwd)
+        # Identical coordinate layout to `extract_element_type_matrix`, except that
+        # the body is interpolated to `element_size` rather than subsampled.
+        pos_left = (start - flank_size + np.arange(flank_size)) % L
+        pos_body = (start + np.arange(actual_len)) % L
+        pos_right = (end + np.arange(flank_size)) % L
+        window = np.concatenate([pos_left, pos_body, pos_right])
 
-            # --- Reconstruct Genomic Indices ---
-            body_indices = []
-            for s, e in intervals:
-                if s < e:
-                    body_indices.extend(range(s, e))
-                else:  # Wrap around origin
-                    body_indices.extend(range(s, L))
-                    body_indices.extend(range(0, e))
+        x_old = np.linspace(0, 1, actual_len)
+        body_slice = slice(flank_size, flank_size + actual_len)
 
-            genomic_start = body_indices[0]
-            genomic_end = (body_indices[-1] + 1) % L
+        def assemble_aligned_signal(values: np.ndarray) -> np.ndarray:
+            """Flanks verbatim, body stretched to the element's median length."""
+            body_interp = np.interp(x_new, x_old, values[body_slice])
+            return np.concatenate([values[:flank_size], body_interp, values[body_slice.stop:]])
 
-            # Flank indices mapped to circular plasmid
-            left_idx = np.arange(genomic_start - flank_size, genomic_start) % L
-            right_idx = np.arange(genomic_end, genomic_end + flank_size) % L
-            body_idx = np.array(body_indices)
+        fwd_genomic = assemble_aligned_signal(tracks["puffin_fwd"][gbk_name][window])
+        rev_genomic = assemble_aligned_signal(tracks["puffin_rev"][gbk_name][window])
 
-            # --- Interpolation & Assembly Helper ---
-            def assemble_aligned_signal(signal_array: np.ndarray) -> np.ndarray:
-                left_flank = signal_array[left_idx]
-                right_flank = signal_array[right_idx]
-                body_raw = signal_array[body_idx]
+        span_start, span_end = tracks["tile_span"][gbk_name]
+        window_tiles = tracks["tile_ids_flat"][span_start:span_end][window]
+        cre_genomics = {
+            cell: assemble_aligned_signal(tracks["cell_tile_preds"][cell][window_tiles])
+            for cell in cell_names
+        }
 
-                # Interpolate body to median length
-                x_old = np.linspace(0, 1, len(body_raw))
-                x_new = np.linspace(0, 1, median_len)
-                body_interp = np.interp(x_new, x_old, body_raw)
-
-                return np.concatenate([left_flank, body_interp, right_flank])
-
-            # Process signals linearly
-            fwd_genomic = assemble_aligned_signal(puffin_fwd)
-            rev_genomic = assemble_aligned_signal(puffin_rev)
-
-            # CREST for all cells
-            crest_tiles = tile_encoding.filter(pl.col("gbk_name") == gbk_name)["tile_ids"].to_list()[0]
-            crest_tiles_arr = np.array(crest_tiles)
-
-            cre_genomics = {}
+        # orientation correction
+        if strand == -1:
             for cell in cell_names:
-                plasmid_crest = cell_tile_preds[cell][crest_tiles_arr]
-                cre_genomics[cell] = assemble_aligned_signal(plasmid_crest)
+                cre_matrices[cell][row_idx] = cre_genomics[cell][::-1]
+            # swap forward / reverse TSS biologically for negative strand elements
+            fwd_matrix[row_idx] = rev_genomic[::-1]
+            rev_matrix[row_idx] = fwd_genomic[::-1]
+        else:
+            for cell in cell_names:
+                cre_matrices[cell][row_idx] = cre_genomics[cell]
+            fwd_matrix[row_idx] = fwd_genomic
+            rev_matrix[row_idx] = rev_genomic
 
-            # orientation correction
-            if strand == -1:
-                for cell in cell_names:
-                    cre_matrices[cell][row_idx] = cre_genomics[cell][::-1]
-                # swap forward / reverse TSS biologically for negative strand elements
-                fwd_matrix[row_idx] = rev_genomic[::-1]
-                rev_matrix[row_idx] = fwd_genomic[::-1]
-            else:
-                for cell in cell_names:
-                    cre_matrices[cell][row_idx] = cre_genomics[cell]
-                fwd_matrix[row_idx] = fwd_genomic
-                rev_matrix[row_idx] = rev_genomic
+    if missing:
+        print(f"Warning: no predictions for {len(missing)} plasmid(s); their rows are left at zero.")
 
     return cre_matrices, fwd_matrix, rev_matrix
+
+
+# STRAND-RESOLVED TSS MASKS
+def extract_tss_matrices(
+    cre_positions: pl.DataFrame, matrix_metadata: pl.DataFrame,
+    element_size: int, flank_size: int,
+    fwd_column: str = "Puffin (FANTOM_CAGE_fwd)",
+    rev_column: str = "Puffin (FANTOM_CAGE_rev)"
+) -> tuple[np.ndarray, np.ndarray]:
+    """TSS peak masks on the element's own strand rather than the plasmid's.
+
+    `extract_regulatory_element_matrix` reverses a minus-strand row but cannot
+    swap the two tracks, so on its own it marks an antisense peak as sense for
+    every minus-strand instance. The signal pileups and `08_element_cre_overlap.py`
+    both resolve TSS by the element's strand, and these masks now agree with them.
+    """
+    genomic_fwd = extract_regulatory_element_matrix(
+        cre_positions, fwd_column, matrix_metadata, element_size, flank_size
+    )
+    genomic_rev = extract_regulatory_element_matrix(
+        cre_positions, rev_column, matrix_metadata, element_size, flank_size
+    )
+
+    on_minus = matrix_metadata["strand"].to_numpy() == -1
+    element_fwd, element_rev = genomic_fwd.copy(), genomic_rev.copy()
+    element_fwd[on_minus], element_rev[on_minus] = genomic_rev[on_minus], genomic_fwd[on_minus]
+    return element_fwd, element_rev
