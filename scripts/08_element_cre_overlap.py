@@ -12,6 +12,7 @@ from plasmidtools import helpers
 # --- CONFIGURATION ---
 ADDGENE_DIR = Path().cwd().parent / "data/addgene"
 ELEMENT_FILE = ADDGENE_DIR / "mammalian_plasmids_elements.parquet"
+ELEMENT_ORIENTATION = ADDGENE_DIR / "mammalian_plasmids_element_orientation.parquet"
 PRIMERS_FILE = ADDGENE_DIR / "mammalian_plasmids_primers.parquet"
 REPR_SEQ_FASTA = ADDGENE_DIR / "element_representative_sequences.fasta"
 CREST_TILE_ENCOD = ADDGENE_DIR / "mammalian_plasmids_crest_encodings.parquet"
@@ -132,9 +133,18 @@ def owned_peak_indices(peaks: list[set], mids: list[int], window: set) -> np.nda
     return np.fromiter(set.union(*owned) & window, dtype=int)
 
 
-def calculate_overlap_statistics(elements_path: Path, output_path: Path) -> None:
+def calculate_overlap_statistics(
+    elements_path: Path, output_path: Path, orientation_path: Path | None = None
+) -> None:
     # 1. Load Datasets
-    elements_df = pl.read_parquet(elements_path)
+    # With an orientation table, direction-free feature types take their strand from
+    # sequence: the GenBank files record none for them, so an element lying reversed
+    # on a plasmid would otherwise have its flank and its TSS strands the wrong way
+    # round. Primers are annotated features and pass no table.
+    elements_df = (
+        pl.read_parquet(elements_path) if orientation_path is None
+        else helpers.load_oriented_elements(elements_path, orientation_path)
+    )
     cre_tss_df = pl.read_parquet(CRE_TSS_FILE)
     stats_df = pl.read_parquet(STATS_FILE)
 
@@ -481,6 +491,6 @@ def extract_representative_sequence_relative_cre_overlaps(output_path: Path) -> 
 
 
 if __name__ == "__main__":
-    calculate_overlap_statistics(ELEMENT_FILE, ELEMENT_OVERLAPS_OUT)  # 20 min, 8 cell lines
+    calculate_overlap_statistics(ELEMENT_FILE, ELEMENT_OVERLAPS_OUT, ELEMENT_ORIENTATION)  # 20 min, 8 cell lines
     calculate_overlap_statistics(PRIMERS_FILE, PRIMERS_OVERLAPS_OUT)  # 11 min, 8 cell lines
     extract_representative_sequence_relative_cre_overlaps(REPR_SEQ_OVERLAPS)  # 2 sec

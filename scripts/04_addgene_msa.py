@@ -1,5 +1,7 @@
 import re
+import shutil
 import subprocess
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -8,6 +10,9 @@ import polars as pl
 from Bio import AlignIO, SeqIO, motifs
 from Bio.Seq import Seq
 from tqdm import tqdm
+
+sys.path.insert(0, "..")
+from plasmidtools import helpers
 
 # --- CONFIGURATION ---
 DATA_DIR = Path().cwd().parent / "data"
@@ -23,6 +28,10 @@ OUT_INDIVIDUAL_DIVERGENCE = ALIGN_DIR / "element_individual_divergence.parquet"
 OUT_AVERAGE_DIVERGENCE = ALIGN_DIR / "element_average_divergence.parquet"
 MSA_ERROR_LOG = ALIGN_DIR / "element_msa_errors.tsv"
 
+FASTA_ORIENTED_DIR = ALIGN_DIR / "fasta_oriented"
+OUT_SEQUENCE_ORIENTATION = ALIGN_DIR / "element_sequence_orientation.parquet"
+OUT_INSTANCE_ORIENTATION = ADDGENE_DIR / "mammalian_plasmids_element_orientation.parquet"
+
 FASTA_CDS_DIR = ALIGN_DIR / "fasta_cds"
 OUT_UNIQUE_SEQUENCE_IDS_CDS = ALIGN_DIR / "element_unique_sequence_ids_cds.parquet"
 OUT_INDIVIDUAL_DIVERGENCE_CDS = ALIGN_DIR / "element_individual_divergence_cds.parquet"
@@ -32,18 +41,162 @@ MSA_ERROR_LOG_CDS = ALIGN_DIR / "element_msa_errors_cds.tsv"
 SEQ_LEN_THRESH = 25
 REPRESENT_FLANK_SIZE = 325
 
-
-def extract_feature_name(feat) -> str:
-    name = None
-    for key in ['label', 'gene', 'note', 'product']:
-        if key in feat.qualifiers:
-            name = feat.qualifiers[key][0]
-            break
-    return name if name else "unknown"
+# Orientation is called by comparing the distinct k-mers of one variant against
+# another's, in both orientations: 12-mers, and at least half of a variant's k-mers
+# must be shared before the two count as the same sequence. MAFFT's own
+# `--adjustdirection` agrees with every call this makes, but also forces one
+# between sequences that merely share an element name.
+ORIENTATION_KMER = 12
+ORIENTATION_MIN_CONTAINMENT = 0.5
 
 
 def sanitize_filename(name: str) -> str:
     return re.sub(r'[^\w\-_\.]', '_', name)
+
+
+def orientation_kmers(sequence: str) -> set[str]:
+    """Distinct k-mers of a sequence: what orientation calls are compared on."""
+    return {sequence[i:i + ORIENTATION_KMER] for i in range(len(sequence) - ORIENTATION_KMER + 1)}
+
+
+def assign_sequence_orientation() -> None:
+    """Orient each sequence variant against the other variants of its element.
+
+    Addgene's GenBank files never write `complement()` for the feature types in
+    `helpers.DIRECTION_FREE_TYPES`, so Biopython reads every one as the plus strand:
+    the two ITRs flanking an adenoviral cassette are exact reverse complements of
+    each other yet are both recorded forward, and averaging their pile-ups
+    superimposes two mirror images. Orientation is recovered from the sequences:
+
+    - Variants are grouped into families first. One element name can cover unrelated
+      sequences - `chimeric intron` spans four that share no 12-mers at all - and an
+      orientation only means something within a family.
+    - Taken most abundant first, a variant joins the family whose member shares the
+      most k-mers with it in either orientation, provided that share reaches
+      `ORIENTATION_MIN_CONTAINMENT`, and adopts that member's orientation, flipped
+      when the match was to its reverse complement. Otherwise it seeds a family.
+    - A family whose reversed instances outnumber its forward ones is flipped whole,
+      so the correction moves as few instances as possible and the orientation
+      plasmid maps usually draw stays the positive one.
+
+    Calls are written for every element, but only direction-free types are acted on:
+    `fasta_oriented/` reverse-complements their reversed variants so the alignments
+    measure divergence rather than orientation, and `helpers.load_oriented_elements`
+    replaces the strand of their instances alone.
+    """
+    uid_df = pl.read_parquet(OUT_UNIQUE_SEQUENCE_IDS)
+    FASTA_ORIENTED_DIR.mkdir(parents=True, exist_ok=True)
+
+    variant_rows = []
+    for (sanitized_name,), element_variants in tqdm(
+        uid_df.group_by(["sanitized_name"], maintain_order=True),
+        desc="Orienting sequence variants", total=uid_df["sanitized_name"].n_unique()
+    ):
+        element_type = element_variants["element_type"][0]
+        element_name = element_variants["element_name"][0]
+        n_instances = dict(element_variants.select(["unique_id", "n_instances"]).iter_rows())
+
+        records = {
+            record.id: str(record.seq).upper()
+            for record in SeqIO.parse(FASTA_DIR / f"{sanitized_name}.fasta", "fasta")
+        }
+        forward = {uid: orientation_kmers(seq) for uid, seq in records.items()}
+        reverse = {
+            uid: orientation_kmers(str(Seq(seq).reverse_complement())) for uid, seq in records.items()
+        }
+
+        # Each family maps its variants to an orientation relative to the variant
+        # that seeded it. Abundant variants are placed first, so a family is seeded
+        # by its own dominant sequence.
+        families: list[dict[str, int]] = []
+        containments: dict[str, float] = {}
+        for unique_id in sorted(n_instances, key=lambda uid: (-n_instances[uid], int(uid.rsplit("|||", 1)[1]))):
+            kmers = forward.get(unique_id, set())
+            best_share, best_family, best_orientation = 0.0, None, 1
+
+            if kmers:
+                for family_index, members in enumerate(families):
+                    for member, member_orientation in members.items():
+                        same = len(kmers & forward[member]) / len(kmers)
+                        flipped = len(kmers & reverse[member]) / len(kmers)
+                        share, orientation = (
+                            (same, member_orientation) if same >= flipped else (flipped, -member_orientation)
+                        )
+                        if share > best_share:
+                            best_share, best_family, best_orientation = share, family_index, orientation
+
+            if best_family is None or best_share < ORIENTATION_MIN_CONTAINMENT:
+                families.append({unique_id: 1})
+                containments[unique_id] = 1.0
+            else:
+                families[best_family][unique_id] = best_orientation
+                containments[unique_id] = best_share
+
+        for members in families:
+            reversed_instances = sum(n_instances[uid] for uid, o in members.items() if o == -1)
+            if 2 * reversed_instances > sum(n_instances[uid] for uid in members):
+                for member in members:
+                    members[member] = -members[member]
+
+        orientation_of = {uid: o for members in families for uid, o in members.items()}
+        for family_index, members in enumerate(families):
+            family_instances = sum(n_instances[uid] for uid in members)
+            for unique_id, orientation in members.items():
+                variant_rows.append({
+                    "element_type": element_type,
+                    "element_name": element_name,
+                    "unique_id": unique_id,
+                    "n_instances": n_instances[unique_id],
+                    "family": family_index,
+                    "family_instances": family_instances,
+                    "orientation": orientation,
+                    "containment": containments[unique_id],
+                })
+
+        # Only direction-free types are reoriented for the alignment: the rest carry
+        # a strand of their own, which is not ours to overrule.
+        reorient = element_type in helpers.DIRECTION_FREE_TYPES
+        fasta_lines = []
+        for unique_id, sequence in records.items():
+            if reorient and orientation_of.get(unique_id, 1) == -1:
+                sequence = str(Seq(sequence).reverse_complement())
+            fasta_lines.append(f">{unique_id}\n{sequence}\n")
+
+        with open(FASTA_ORIENTED_DIR / f"{sanitized_name}.fasta", "w") as f:
+            f.writelines(fasta_lines)
+
+    variants = pl.DataFrame(variant_rows)
+    variants.write_parquet(OUT_SEQUENCE_ORIENTATION)
+
+    # One row per element instance, for `helpers.load_oriented_elements`. Duplicate
+    # annotations of one feature share a sequence, and so an orientation.
+    key = ["gbk_name", "element_type", "element_name", "intervals"]
+    instances = (
+        uid_df.select(["element_type", "element_name", "unique_id", "gbk_names", "positions"])
+        .explode(["gbk_names", "positions"])
+        .rename({"gbk_names": "gbk_name", "positions": "intervals"})
+        .join(variants.select(["unique_id", "family", "orientation"]), on="unique_id")
+        .rename({"orientation": "sequence_orientation"})
+        .unique(subset=key, keep="first")
+        .select([*key, "unique_id", "family", "sequence_orientation"])
+    )
+    instances.write_parquet(OUT_INSTANCE_ORIENTATION)
+
+    reversed_by_type = (
+        instances.filter(pl.col("element_type").is_in(list(helpers.DIRECTION_FREE_TYPES)))
+        .group_by("element_type")
+        .agg(
+            pl.len().alias("instances"),
+            (pl.col("sequence_orientation") == -1).sum().alias("reversed"),
+        )
+        .sort("reversed", descending=True)
+    )
+    print(
+        f"Oriented {variants.height} variants across "
+        f"{variants.select(['element_type', 'element_name']).n_unique()} elements; "
+        f"{int(reversed_by_type['reversed'].sum())} instances of direction-free types are reversed"
+    )
+    print(reversed_by_type)
 
 
 def extract_subtypes_to_fasta() -> None:
@@ -62,7 +215,7 @@ def extract_subtypes_to_fasta() -> None:
                 continue
 
             element_type = feat.type
-            element_name = extract_feature_name(feat)
+            element_name = helpers.extract_feature_name(feat)
             sanitized_id = f"{sanitize_filename(element_type)}__{sanitize_filename(element_name)}"
 
             sequence = str(feat.extract(record.seq)).upper()
@@ -130,7 +283,7 @@ def extract_cds_aa_to_fasta() -> None:
                 continue
 
             element_type = feat.type
-            element_name = extract_feature_name(feat)
+            element_name = helpers.extract_feature_name(feat)
             sanitized_id = f"{sanitize_filename(element_type)}__{sanitize_filename(element_name)}"
 
             nt_sequence = str(feat.extract(record.seq)).upper()
@@ -231,7 +384,8 @@ def make_and_analyze_msa():
         for row in uid_df.iter_rows(named=True)
     }
 
-    fasta_files = sorted(FASTA_DIR.glob("*.fasta"))
+    # Oriented copies, so divergence measures sequence rather than orientation.
+    fasta_files = sorted(FASTA_ORIENTED_DIR.glob("*.fasta"))
     for fasta_file in tqdm(fasta_files, desc="Aligning and generating PWMs"):
         current_file_stem = fasta_file.stem
         msa_file = fasta_file.with_suffix(".aln")
@@ -272,6 +426,16 @@ def make_and_analyze_msa():
             continue
 
         # 2. Generate MSA using MAFFT
+        # Orientation left this element untouched, so the alignment made from the
+        # sequences as extracted still holds: copy it instead of realigning.
+        as_extracted = FASTA_DIR / fasta_file.name
+        extracted_msa = as_extracted.with_suffix(".aln")
+        if (
+            not msa_file.exists() and extracted_msa.exists()
+            and as_extracted.read_bytes() == fasta_file.read_bytes()
+        ):
+            shutil.copyfile(extracted_msa, msa_file)
+
         mafft_error = align_with_mafft(fasta_file, msa_file)
         if mafft_error is not None:
             errors_log.append({"file_name": current_file_stem, "error_loc": "mafft run", "error": mafft_error})
@@ -543,6 +707,19 @@ def get_representative_sequence(plasmid_citations: pl.DataFrame, flank_size: int
     pmid_map = dict(zip(plasmid_citations["gbk_name"].to_list(), plasmid_citations["citing_pmids"].to_list())) 
     element_records = defaultdict(list) 
 
+    # Direction-free feature types carry no strand in the GenBank files, so a
+    # reversed instance would have its window saved in the wrong orientation. Their
+    # sequence orientation is looked up here and composed with the annotated strand.
+    sequence_orientation = {
+        (
+            row["gbk_name"], row["element_type"], row["element_name"],
+            tuple(tuple(part) for part in row["intervals"]),
+        ): row["sequence_orientation"]
+        for row in pl.read_parquet(OUT_INSTANCE_ORIENTATION)
+        .filter(pl.col("element_type").is_in(list(helpers.DIRECTION_FREE_TYPES)))
+        .iter_rows(named=True)
+    }
+
     for record in tqdm(SeqIO.parse(COMBINED_GBK, "genbank"), total=N_PLASMIDS): 
         L = len(record.seq) 
         gbk_name = record.name 
@@ -554,7 +731,7 @@ def get_representative_sequence(plasmid_citations: pl.DataFrame, flank_size: int
                 continue 
 
             e_type = feat.type 
-            e_name = extract_feature_name(feat) 
+            e_name = helpers.extract_feature_name(feat) 
 
             # 1. Collect all component indices of the feature body 
             parts = [] 
@@ -617,6 +794,14 @@ def get_representative_sequence(plasmid_citations: pl.DataFrame, flank_size: int
 
             # Safely capture strand direction
             strand = feat.location.strand if feat.location.strand is not None else 1
+            if e_type in helpers.DIRECTION_FREE_TYPES:
+                instance_key = (
+                    gbk_name, e_type, e_name,
+                    tuple((int(p.start), int(p.end)) for p in feat.location.parts),
+                )
+                # Orientation is relative to strand-aware extraction, so it composes
+                # with the annotated strand rather than replacing it.
+                strand = strand * sequence_orientation.get(instance_key, 1)
 
             # 5. Build string with case demarcations (Body = Upper, Gap / Flank = Lower) 
             chars = [] 
@@ -729,8 +914,9 @@ if __name__ == "__main__":
     )
     N_PLASMIDS = plasmid_citations.height
 
-    extract_subtypes_to_fasta()  # 1.5 min
-    extract_cds_aa_to_fasta()  # 1.5 min
-    make_and_analyze_msa()  # 17 min (Gold-6242 CPU)
+    extract_subtypes_to_fasta()  # 30 sec
+    assign_sequence_orientation()  # 30 sec
+    extract_cds_aa_to_fasta()  # 30 sec
+    make_and_analyze_msa()  # 17 min from scratch; only reoriented elements realign
     make_and_analyze_msa_cds()  # 4 min (Gold-6242 CPU)
-    # get_representative_sequence(plasmid_citations, REPRESENT_FLANK_SIZE)  # 8 min
+    get_representative_sequence(plasmid_citations, REPRESENT_FLANK_SIZE)  # 8 min

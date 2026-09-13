@@ -16,6 +16,7 @@ PILEUP_FIGURES = FIGURES_DIR / "pileups"
 ADDGENE_DIR = DATA_DIR / "addgene"
 MANUAL_DIR = DATA_DIR / "manual_annotations"
 ELEMENT_POSITIONS = ADDGENE_DIR / "mammalian_plasmids_elements.parquet"
+ELEMENT_ORIENTATION = ADDGENE_DIR / "mammalian_plasmids_element_orientation.parquet"
 PLASMID_STATS = ADDGENE_DIR / "mammalian_plasmids_statistics.parquet"
 CRE_TSS_FILE = ADDGENE_DIR / "mammalian_plasmids_cre_and_tss.parquet"
 CLUSTERING_FILE = ADDGENE_DIR / "element_cre_overlap_clustering.csv"
@@ -54,6 +55,37 @@ def outdated_stored_elements(element_positions: pl.DataFrame) -> list[tuple[str,
         for element_type, element_name in element_keys.rows()
         if f"{helpers.sanitize_filename(element_type)}/{helpers.sanitize_filename(element_name)}" in outdated
     ]
+
+
+def remove_orphaned_groups(element_positions: pl.DataFrame) -> list[str]:
+    """Delete stored pile-up groups whose element name no longer exists.
+
+    Element names get refined - `helpers.extract_feature_name` now splits labels
+    that cover unrelated sequences, so `chimeric intron` became four elements - and
+    a group stored under a retired name would otherwise stay in the file, never
+    refreshed, for a notebook to load by its old name. HDF5 does not hand the freed
+    space back to the file system; `h5repack` reclaims it if that matters.
+    """
+    if not PILEUP_PATH.exists():
+        return []
+
+    current = {
+        f"{helpers.sanitize_filename(element_type)}/{helpers.sanitize_filename(element_name)}"
+        for element_type, element_name in element_positions.select(["element_type", "element_name"]).unique().rows()
+    }
+    with h5py.File(PILEUP_PATH, "a") as h5f:
+        orphaned = sorted(
+            f"{group_type}/{group_name}"
+            for group_type in h5f
+            for group_name in h5f[group_type]
+            if f"{group_type}/{group_name}" not in current
+        )
+        for group_path in orphaned:
+            del h5f[group_path]
+        for group_type in [group_type for group_type in h5f if len(h5f[group_type]) == 0]:
+            del h5f[group_type]
+
+    return orphaned
 
 
 def process_element(
@@ -152,7 +184,10 @@ if __name__ == "__main__":
 
     # --- 1. Data ---
     plasmid_stats = pl.read_parquet(PLASMID_STATS)
-    element_positions = pl.read_parquet(ELEMENT_POSITIONS)
+    # Direction-free feature types take their strand from sequence, so an element
+    # found reversed on a plasmid is drawn in its own orientation rather than the
+    # plasmid's - half the ITR rows were mirror images of the other half.
+    element_positions = helpers.load_oriented_elements(ELEMENT_POSITIONS, ELEMENT_ORIENTATION)
     element_lengths = (
         element_positions
         .group_by(["element_type", "element_name"])
@@ -177,7 +212,7 @@ if __name__ == "__main__":
     # # --- 2. Processing Custom Elements ---
     # for element_type, element_name, write_to_file, visualize in [
     #     ["rep_origin", "RSF ori", True, False],
-    #     ["LTR", "3' LTR", True, False],
+    #     ["LTR", "3' LTR [LTR HIV-1]", True, False],
     #     ["misc_feature", "Rosa26 left arm", True, False],
     #     ["mobile_element", "IS1", True, False],
     #     ["rep_origin", "SV40 ori", True, False],
@@ -185,7 +220,7 @@ if __name__ == "__main__":
     #     ["misc_signal", "Ad5 Psi", True, False],
     #     ["repeat_region", "ITR", True, False],
     #     ["rep_origin", "ori", True, False],
-    #     ["intron", "chimeric intron", True, False],
+    #     ["intron", "chimeric intron [chimera introns from chicken beta-actin rabbit]", True, False],
     #     ["CDS", "ABE(7.10)", True, False]
     # ]:
     #     process_element(element_type, element_name, write_to_file, visualize, **data)
@@ -196,6 +231,11 @@ if __name__ == "__main__":
     #     process_element(element_type, element_name, True, False, **data)
 
     # --- 4. Refreshing Outdated Stored Pile-ups ---
+    # Groups under names no element carries any more are removed first; they could
+    # not be rebuilt, since nothing maps back to them.
+    for group_path in remove_orphaned_groups(element_positions):
+        print(f"Removed {group_path}: no current element carries that name.")
+
     # Groups written before `helpers.PILEUP_FORMAT` took their signal tracks from the
     # stored interval order and their TSS masks from the plasmid strand. Rebuild all
     # of them, so notebooks 02 and 03 never load one; matrices only, no figures.

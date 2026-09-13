@@ -8,6 +8,7 @@ from Bio import SeqIO
 from tqdm import tqdm
 
 sys.path.insert(0, "..")
+from plasmidtools import helpers
 from plasmidtools.search import PlasmidSearchSuffixArray
 
 # --- CONFIGURATION ---
@@ -55,10 +56,7 @@ def load_plasmid_features(gbk_path: Path) -> dict[str, list[dict]]:
         for f in record.features:
             if f.type == "source":
                 continue
-            name = f.qualifiers.get("label", f.qualifiers.get("note", f.qualifiers.get("gene", [""])))[0]
-            if not name:
-                name = "unnamed"
-            feat_name = f"{f.type}:{name}"
+            feat_name = f"{f.type}:{helpers.extract_feature_name(f)}"
             
             for part in f.location.parts:
                 feats.append({

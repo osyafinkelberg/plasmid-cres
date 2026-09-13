@@ -6,7 +6,7 @@ import polars as pl
 from tqdm import tqdm
 
 sys.path.insert(0, "..")
-from plasmidtools import crest, pileups
+from plasmidtools import crest, helpers, pileups
 
 # --- CONFIGURATION ---
 DATA_DIR = Path().cwd().parent / "data"
@@ -14,6 +14,7 @@ ADDGENE_DIR = DATA_DIR / "addgene"
 MANUAL_DIR = DATA_DIR / "manual_annotations"
 
 ELEMENT_POSITIONS = ADDGENE_DIR / "mammalian_plasmids_elements.parquet"
+ELEMENT_ORIENTATION = ADDGENE_DIR / "mammalian_plasmids_element_orientation.parquet"
 CREST_TILE_ENCOD = ADDGENE_DIR / "mammalian_plasmids_crest_encodings.parquet"
 CREST_TILE_PREDS = ADDGENE_DIR / "mammalian_plasmids_crest_preds.parquet"
 PUFFIN_PREDS = ADDGENE_DIR / "mammalian_plasmids_puffin_preds.h5"
@@ -84,7 +85,8 @@ if __name__ == "__main__":
         .rename({"length": "element_length"})
     )
     plasmid_stats = pl.read_parquet(ADDGENE_DIR / "mammalian_plasmids_statistics.parquet")
-    element_positions = pl.read_parquet(ADDGENE_DIR / "mammalian_plasmids_elements.parquet")
+    # Enhancers carry no strand in the GenBank files, so theirs comes from sequence.
+    element_positions = helpers.load_oriented_elements(ELEMENT_POSITIONS, ELEMENT_ORIENTATION)
     cre_positions = pl.read_parquet(ADDGENE_DIR / "mammalian_plasmids_cre_and_tss.parquet")
     promoters = pl.read_csv(MANUAL_DIR / "addgene_promoters_and_enhancers.csv")
 
