@@ -41,8 +41,13 @@ CONTRIB_FORMAT = 1
 MIN_PLOT_DISTANCE = 200
 
 # Narrowest y-ranges drawn; `contribution_scores_plot` widens them to fit the data.
-CREST_Y_RANGE = (-1.0, 2.5)
-PUFFIN_Y_RANGE = (-1.0, 100.0)
+# CREST pages share one range (widened on 12 of 256), so CRE strength compares
+# across elements. Puffin letter stacks span 3.4-185 between pages, which no shared
+# range suits, so this is only a floor and each page fits its own data.
+CREST_Y_RANGE = (-0.3, 0.6)
+PUFFIN_Y_RANGE = (-5.0, 10.0)
+# Per-bp TACS threshold line; the 0.15 was never calibrated on Puffin's scale.
+CREST_TACS_THRESHOLD = 0.15
 YLABEL_FONTSIZE = 25  # above FONT_SIZES["axis_label"]; kept from the earlier figures
 
 
@@ -242,13 +247,13 @@ def process_element(
     # The representative sequence and its TSS calls are both on the element's own
     # strand, so the forward Puffin track is the element strand.
     tracks = [
-        (f"CREST ({CRE_CELL})", cre_contribs, cre_row[f"CREST ({CRE_CELL})"][0].to_list(), 0, flank_size, CREST_Y_RANGE),
-        ("Puffin CAGE, element strand", fwd_contribs, cre_row["Puffin (FANTOM_CAGE_fwd)"][0].to_list(), PUFFIN_FLANK, flank_size - PUFFIN_FLANK, PUFFIN_Y_RANGE),
-        ("Puffin CAGE, opposite strand", rev_contribs, cre_row["Puffin (FANTOM_CAGE_rev)"][0].to_list(), PUFFIN_FLANK, flank_size - PUFFIN_FLANK, PUFFIN_Y_RANGE),
+        (f"CREST ({CRE_CELL})", cre_contribs, cre_row[f"CREST ({CRE_CELL})"][0].to_list(), 0, flank_size, CREST_Y_RANGE, CREST_TACS_THRESHOLD),
+        ("Puffin CAGE, element strand", fwd_contribs, cre_row["Puffin (FANTOM_CAGE_fwd)"][0].to_list(), PUFFIN_FLANK, flank_size - PUFFIN_FLANK, PUFFIN_Y_RANGE, None),
+        ("Puffin CAGE, opposite strand", rev_contribs, cre_row["Puffin (FANTOM_CAGE_rev)"][0].to_list(), PUFFIN_FLANK, flank_size - PUFFIN_FLANK, PUFFIN_Y_RANGE, None),
     ]
     pages = [
-        (label, scores, start, stop, track_flank, y_range)
-        for label, scores, intervals, offset, track_flank, y_range in tracks
+        (label, scores, start, stop, track_flank, y_range, threshold)
+        for label, scores, intervals, offset, track_flank, y_range, threshold in tracks
         for start, stop in plot_windows(intervals, offset, scores.shape[1])
     ]
     if not pages:
@@ -257,8 +262,10 @@ def process_element(
 
     filestem = f"{plasmidtools.helpers.sanitize_filename(element_type)}__{plasmidtools.helpers.sanitize_filename(element_name)}"
     with PdfPages(output_figures_dir / f"{filestem}.pdf") as pdf:
-        for label, scores, start, stop, track_flank, (y_min, y_max) in pages:
-            fig, ax = plasmidtools.contribplots.contribution_scores_plot(scores[:, start:stop], y_min=y_min, y_max=y_max)
+        for label, scores, start, stop, track_flank, (y_min, y_max), threshold in pages:
+            fig, ax = plasmidtools.contribplots.contribution_scores_plot(
+                scores[:, start:stop], y_min=y_min, y_max=y_max, per_pos_threshold=threshold,
+            )
             fig, ax = plasmidtools.contribplots.apply_element_annotations(
                 fig, ax, slice_start=start, slice_end=stop,
                 flank_size=track_flank, element_size=element_size,

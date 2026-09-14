@@ -5,6 +5,14 @@ import logomaker
 
 from .statplots import FONT_SIZES
 
+# Logo page geometry: a base is always this wide, whatever the window length, so the
+# y-range alone decides how stretched the letters look.
+LOGO_IN_PER_BP = 18 / 200
+LOGO_FIG_HEIGHT = 8
+# Tallest letter drawn no thinner than this height:width ratio. A typical page sits
+# near 25:1; the cap only reaches the pages that fit a strong stack into a short axis.
+MAX_LETTER_ASPECT = 30
+
 
 def rolling_absolute_contribution_scores(scores: np.ndarray, window: int = 10) -> np.ndarray:
     negative_sums = -scores.clip(max=0).sum(axis=0)
@@ -20,34 +28,46 @@ def rolling_absolute_contribution_scores(scores: np.ndarray, window: int = 10) -
 
 
 def contribution_scores_plot(
-    scores: np.ndarray, 
+    scores: np.ndarray,
     tacs_window: int = 5,
-    per_pos_threshold: float = 0.15,
-    y_min: float = -1,
-    y_max: float = 2.5,
+    per_pos_threshold: float | None = 0.15,
+    y_min: float = -0.3,
+    y_max: float = 0.6,
     cre_label: str = "CRE",
     fit_data: bool = True,
 ) -> tuple[plt.Figure, plt.Axes]:
     """
-    Renders importance score logo distributions layered with TACS and 
+    Renders importance score logo distributions layered with TACS and
     secondary regulatory density tracks, ensuring perfectly aligned zero-baselines.
+
+    TACS is drawn per bp - the mean absolute contribution over `tacs_window` - so it
+    shares the letters' units and `per_pos_threshold` is read straight off the axis;
+    `None` omits that line for tracks it was not calibrated on (Puffin).
 
     With `fit_data`, `y_min` / `y_max` are the narrowest range drawn: they widen to
     fit the logo stacks and the TACS track when those exceed it, so a strong element
-    is not clipped while weak ones keep a common scale.
+    is not clipped while weak ones keep a common scale. The defaults suit CREST,
+    whose letter stacks on plasmid elements peak at 0.25 (median) to 0.88.
+
+    Fitting a strong stack into a short axis is what makes glyphs unreadable, so the
+    range is then stretched further if needed to hold the tallest letter at
+    MAX_LETTER_ASPECT or wider.
     """
     score_df = pl.DataFrame(scores.astype(np.float64).T, schema=["A", "C", "G", "T"]).to_pandas()
     length = score_df.shape[0]
-    
-    fig, ax = plt.subplots(figsize=(18 * length / 200, 8), dpi=300)
-    
+
+    fig, ax = plt.subplots(figsize=(LOGO_IN_PER_BP * length, LOGO_FIG_HEIGHT), dpi=300)
+
     # 1. Base Sequence Logo canvas mapping
     logomaker.Logo(score_df, ax=ax, center_values=False)
-    
-    # 2. Superimpose structural TACS sequence track
-    tacs = rolling_absolute_contribution_scores(scores, window=tacs_window)
-    ax.plot(np.arange(length), tacs, color='cornflowerblue', linewidth=3.0, label='TACS', zorder=4)
-    ax.axhline(per_pos_threshold * tacs_window, linestyle='--', color='red', linewidth=1.2, alpha=0.7, zorder=3)
+
+    # 2. Superimpose structural TACS sequence track. As a 5-bp sum it ran ~3.7x above
+    # the letters and set the axis height; per bp it rides along the stack tops, so it
+    # is drawn thin and translucent to leave the letters readable.
+    tacs = rolling_absolute_contribution_scores(scores, window=tacs_window) / tacs_window
+    ax.plot(np.arange(length), tacs, color='cornflowerblue', linewidth=2.0, alpha=0.6, label='TACS', zorder=4)
+    if per_pos_threshold is not None:
+        ax.axhline(per_pos_threshold, linestyle='--', color='red', linewidth=1.2, alpha=0.7, zorder=3)
     
     # Define primary axis bounds
     y1_min, y1_max = y_min, y_max
@@ -56,6 +76,17 @@ def contribution_scores_plot(
         stack_bottom = float(scores.clip(max=0).sum(axis=0).min(initial=0.0))
         y1_max = max(y_max, 1.05 * stack_top)
         y1_min = min(y_min, 1.05 * stack_bottom)
+        # A base is always LOGO_IN_PER_BP wide, so fitting a tall stack stretches its
+        # letters into spikes - FMDV IRES reached 60:1 against a median page's 25:1.
+        # Stretch the range instead, both ends alike so the baseline keeps its place,
+        # until the tallest letter is no thinner than MAX_LETTER_ASPECT. Pages already
+        # below it are left on the shared range.
+        tallest_letter = float(np.abs(scores).max(initial=0.0))
+        needed_span = LOGO_FIG_HEIGHT * tallest_letter / (MAX_LETTER_ASPECT * LOGO_IN_PER_BP)
+        span = y1_max - y1_min
+        if span > 0 and needed_span > span:
+            y1_max *= needed_span / span
+            y1_min *= needed_span / span
     ax.set_ylim([y1_min, y1_max])
     ax.set_xlim([0, length])
     
