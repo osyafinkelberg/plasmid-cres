@@ -11,6 +11,7 @@ from matplotlib import gridspec
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import LinearSegmentedColormap, ListedColormap, Normalize
 from matplotlib.lines import Line2D
+from matplotlib.ticker import FuncFormatter, NullLocator
 from matplotlib.transforms import blended_transform_factory
 from scipy.cluster.hierarchy import fcluster, leaves_list, linkage
 from scipy.spatial.distance import pdist
@@ -19,6 +20,14 @@ from scipy.spatial.distance import pdist
 # `<metric> (<cell>)`. This is the cell line assumed when a caller does not name
 # one; TSS metrics are cell-agnostic and keep their plain names.
 DEFAULT_CRE_CELL = "HEK293T"
+
+# Puffin CAGE panel of `combined_prediction_pileups`: linear below the TSS call
+# threshold, logarithmic above it, over one range shared by every element so pages
+# compare directly - per-element limits let a promoter TSS in the flank squash the
+# element's own signal to under 10% of the axis for half the active elements.
+PUFFIN_TSS_THRESHOLD = 0.1  # PUFFIN_CAGE_THRESH in `07_cre_annotation.py`
+PUFFIN_Y_LIMIT = 8.5  # the largest 95th-percentile curve across all 189 stored pileups is 7.42
+PUFFIN_Y_TICKS = (-5, -1, -0.5, -0.1, 0, 0.1, 0.5, 1, 5)
 
 # Figures are read from slides and printed panels, not zoomed in a notebook, so
 # every text element is sized up front. Tune a figure's type here rather than by
@@ -624,6 +633,10 @@ def combined_prediction_pileups(
 
     `percentile_bands` are (low, high, alpha) triples, drawn in the order given,
     so list the widest first and let the narrower ones darken on top of it.
+
+    The Puffin panel is on an asinh scale, linear up to the TSS call threshold and
+    logarithmic above it, with one range for every element: a strong TSS in the
+    flank no longer flattens the element's own signal, and pages compare directly.
     """
     total_len = cre_matrix.shape[1]
     element_size = total_len - 2 * flank_size
@@ -665,17 +678,27 @@ def combined_prediction_pileups(
         ax2.fill_between(x_axis, -rev_curves[high], -rev_curves[low], color='forestgreen', alpha=alpha, lw=0)
 
     # Trend lines
-    ax2.plot(x_axis, np.nanmean(fwd_matrix, axis=0), color='navy', lw=2, label="Feature Strand (5'→3')")
-    ax2.plot(x_axis, -np.nanmean(rev_matrix, axis=0), color='darkgreen', lw=2, label='Opposite Strand')
+    fwd_mean, rev_mean = np.nanmean(fwd_matrix, axis=0), np.nanmean(rev_matrix, axis=0)
+    ax2.plot(x_axis, fwd_mean, color='navy', lw=2, label="Feature Strand (5'→3')")
+    ax2.plot(x_axis, -rev_mean, color='darkgreen', lw=2, label='Opposite Strand')
 
     # Baseline for mirror plot
     ax2.axhline(0, color='black', lw=1, alpha=0.5)
 
-    ax2.set_ylabel("Puffin CAGE (± Strand)", fontweight='bold', fontsize=FONT_SIZES["axis_label"])
-    strand_peak = max(
-        float(np.nanmax(fwd_curves[max(levels)])), float(np.nanmax(rev_curves[max(levels)]))
-    )
-    ax2.set_ylim([-max(0.5, 1.1 * strand_peak), max(0.5, 1.1 * strand_peak)])
+    ax2.set_ylabel("Puffin CAGE (± Strand)\nasinh scale", fontweight='bold', fontsize=FONT_SIZES["axis_label"])
+    # The mean can outrun the top band when a few instances carry a strong TSS.
+    strand_peak = max(float(np.nanmax(curve)) for curve in (
+        fwd_curves[max(levels)], rev_curves[max(levels)], fwd_mean, rev_mean
+    ))
+    limit = max(PUFFIN_Y_LIMIT, 1.1 * strand_peak)
+    ax2.set_yscale("asinh", linear_width=PUFFIN_TSS_THRESHOLD)
+    ax2.set_ylim([-limit, limit])
+    # The default asinh ticks within +-8.5 are only 0, +-0.1 and +-1, written as powers of ten.
+    ax2.set_yticks([tick for tick in PUFFIN_Y_TICKS if abs(tick) <= limit])
+    ax2.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}"))
+    ax2.yaxis.set_minor_locator(NullLocator())
+    for sign in (1, -1):
+        ax2.axhline(sign * PUFFIN_TSS_THRESHOLD, color='gray', lw=1, ls=':', alpha=0.5, zorder=1)
     ax2.legend(loc='upper right', frameon=False, fontsize=FONT_SIZES["legend"])
 
     # --- GLOBAL FORMATTING ---

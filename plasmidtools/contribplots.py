@@ -3,6 +3,8 @@ import polars as pl
 import matplotlib.pyplot as plt
 import logomaker
 
+from .statplots import FONT_SIZES
+
 
 def rolling_absolute_contribution_scores(scores: np.ndarray, window: int = 10) -> np.ndarray:
     negative_sums = -scores.clip(max=0).sum(axis=0)
@@ -24,10 +26,15 @@ def contribution_scores_plot(
     y_min: float = -1,
     y_max: float = 2.5,
     cre_label: str = "CRE",
+    fit_data: bool = True,
 ) -> tuple[plt.Figure, plt.Axes]:
     """
     Renders importance score logo distributions layered with TACS and 
     secondary regulatory density tracks, ensuring perfectly aligned zero-baselines.
+
+    With `fit_data`, `y_min` / `y_max` are the narrowest range drawn: they widen to
+    fit the logo stacks and the TACS track when those exceed it, so a strong element
+    is not clipped while weak ones keep a common scale.
     """
     score_df = pl.DataFrame(scores.astype(np.float64).T, schema=["A", "C", "G", "T"]).to_pandas()
     length = score_df.shape[0]
@@ -44,6 +51,11 @@ def contribution_scores_plot(
     
     # Define primary axis bounds
     y1_min, y1_max = y_min, y_max
+    if fit_data:
+        stack_top = float(max(scores.clip(min=0).sum(axis=0).max(initial=0.0), np.nanmax(tacs, initial=0.0)))
+        stack_bottom = float(scores.clip(max=0).sum(axis=0).min(initial=0.0))
+        y1_max = max(y_max, 1.05 * stack_top)
+        y1_min = min(y_min, 1.05 * stack_bottom)
     ax.set_ylim([y1_min, y1_max])
     ax.set_xlim([0, length])
     
@@ -51,6 +63,7 @@ def contribution_scores_plot(
     ax.axhline(0, color='#94a3b8', linestyle='-', linewidth=1.0, alpha=0.5, zorder=2)
 
     ax.tick_params(axis='x', bottom=True, labelbottom=True)
+    ax.tick_params(axis='y', labelsize=FONT_SIZES["tick"])
     ax.grid(False)
     plt.subplots_adjust(wspace=0, hspace=0.1)
     
@@ -124,6 +137,6 @@ def apply_element_annotations(
     # Sort coordinates concurrently to prevent visual overlapping artifacts
     sorted_order = np.argsort(tick_positions)
     ax.set_xticks([tick_positions[i] for i in sorted_order])
-    ax.set_xticklabels([tick_labels[i] for i in sorted_order], fontsize=13, rotation=90, color='#334155')
+    ax.set_xticklabels([tick_labels[i] for i in sorted_order], fontsize=FONT_SIZES["tick"], rotation=90, color='#334155')
     
     return fig, ax
