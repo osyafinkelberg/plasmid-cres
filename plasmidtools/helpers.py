@@ -412,10 +412,11 @@ def load_contribution_scores(
     if not h5_path.exists():
         raise FileNotFoundError(f"The dataset file {h5_path} does not exist.")
 
-    # Replicate the sanitization used during writing to ensure path matching
-    sanitized_type = element_type.replace("/", "_")
-    sanitized_name = element_name.replace("/", "_")
-    group_path = f"{sanitized_type}/{sanitized_name}"
+    # Replicate the sanitization used during writing to ensure path matching. This is
+    # `sanitize_filename`, the same scheme the pile-up groups use, so a group path means
+    # the same thing in both files; it replaced a bare "/" -> "_" that spelled 349 of the
+    # 1,270 element names differently from the pile-ups.
+    group_path = f"{sanitize_filename(element_type)}/{sanitize_filename(element_name)}"
 
     result = {}
     with h5py.File(h5_path, "r") as h5f:

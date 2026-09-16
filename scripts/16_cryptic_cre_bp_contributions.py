@@ -120,8 +120,15 @@ def obtain_puffin_contribution_scores(puffin_model: puffin.Puffin, element_seque
 
 
 def contrib_group_path(element_type: str, element_name: str) -> str:
-    """HDF5 group of an element, as `helpers.load_contribution_scores` looks it up."""
-    return f"{element_type.replace('/', '_')}/{element_name.replace('/', '_')}"
+    """HDF5 group of an element, as `helpers.load_contribution_scores` looks it up.
+
+    The same sanitization as the pile-up groups in `15_element_pileups.py`, so one
+    group path addresses the same element in both files.
+    """
+    return (
+        f"{plasmidtools.helpers.sanitize_filename(element_type)}"
+        f"/{plasmidtools.helpers.sanitize_filename(element_name)}"
+    )
 
 
 def sequence_fingerprint(sequence: str) -> str:
