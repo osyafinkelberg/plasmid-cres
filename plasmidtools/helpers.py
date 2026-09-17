@@ -21,9 +21,15 @@ PUFFIN_KEYS = [
 # regulatory and 11,838 repeat_region features carry one, and intron has 1 of
 # 18,504. Biopython reads a location without `complement()` as the plus strand, so
 # on these types a strand of +1 records no direction at all and an element sitting
-# reversed on a plasmid still reads forward. `04_addgene_msa.py` assigns their
-# orientation from sequence instead. 5'UTR is left out: 12 of its 207 features are
-# written with `complement()`, so it does carry a direction.
+# reversed on a plasmid still reads forward. 5'UTR is left out: 12 of its 207
+# features are written with `complement()`, so it does carry a direction.
+#
+# Documentation only: nothing gates on this set any more. A plus-strand annotation
+# records no direction on ANY type - 3,293 instances of rep_origin, protein_bind,
+# promoter, terminator and 5'UTR sit reversed while annotated +1, which put
+# `pRO1600 oriV` at 45% divergence against its own reverse complement - so
+# `04_addgene_msa.py` orients every type from sequence and `load_oriented_elements`
+# applies that call wherever one exists.
 DIRECTION_FREE_TYPES = frozenset({
     "3'UTR", "LTR", "RBS", "enhancer", "exon", "gap", "intron", "misc_feature",
     "misc_recomb", "misc_signal", "mobile_element", "oriT", "polyA_signal",
@@ -211,17 +217,18 @@ def load_representative_sequences(fasta_path: Path | str) -> dict[tuple[str, str
 
 
 def load_oriented_elements(elements_path: Path | str, orientation_path: Path | str) -> pl.DataFrame:
-    """The element table, with direction-free strands taken from sequence.
+    """The element table, with strands taken from sequence wherever one was called.
 
-    For instances of `DIRECTION_FREE_TYPES` that `04_addgene_msa.py` oriented,
-    `strand` becomes the GenBank strand times that sequence orientation. The
-    orientation is relative to sequences extracted strand-aware, so the product is
-    what places the rare instance these types do write with `complement()` (an
-    intron and a 3'UTR); every other one is annotated +1 and simply takes the
-    orientation. The GenBank value is kept as `annotated_strand`, and
-    `orientation_source` says which of the two each row uses. Annotated types keep their strand, as do features below the
-    25 bp extraction threshold (`regulatory` and `RBS` are ~10 bp) and any variant
-    too diverged to place.
+    For every instance `04_addgene_msa.py` oriented, `strand` becomes the GenBank
+    strand times that sequence orientation. The orientation is relative to sequences
+    extracted strand-aware, so the product is what places an instance that does carry
+    `complement()`; one annotated +1 simply takes the orientation. The sequence is the
+    ground truth: where the two disagree the call wins, which flips 5 instances of
+    `rrnB T1 terminator` written `complement()` yet reversed against their family.
+    The GenBank value is kept as `annotated_strand`, and `orientation_source` says
+    which of the two each row uses. Features below the 25 bp extraction threshold
+    (`regulatory` and `RBS` are ~10 bp) and variants too diverged to place have no
+    call and keep their annotated strand.
 
     Row order is preserved: `08_element_cre_overlap.py` walks the table expecting a
     plasmid's elements to be contiguous.
@@ -233,10 +240,7 @@ def load_oriented_elements(elements_path: Path | str, orientation_path: Path | s
     oriented = (
         elements.join(orientation, on=key, how="left", maintain_order="left")
         .with_columns(
-            from_sequence=(
-                pl.col("element_type").is_in(list(DIRECTION_FREE_TYPES))
-                & pl.col("sequence_orientation").is_not_null()
-            )
+            from_sequence=pl.col("sequence_orientation").is_not_null()
         )
         .with_columns(
             annotated_strand=pl.col("strand"),

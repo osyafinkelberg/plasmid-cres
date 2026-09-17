@@ -79,10 +79,15 @@ def assign_sequence_orientation() -> None:
       so the correction moves as few instances as possible and the orientation
       plasmid maps usually draw stays the positive one.
 
-    Calls are written for every element, but only direction-free types are acted on:
-    `fasta_oriented/` reverse-complements their reversed variants so the alignments
-    measure divergence rather than orientation, and `helpers.load_oriented_elements`
-    replaces the strand of their instances alone.
+    Calls are written for every element and acted on for every type: `fasta_oriented/`
+    reverse-complements each reversed variant so the alignments measure divergence
+    rather than orientation, and `helpers.load_oriented_elements` composes the call
+    into the strand. Gating this on `helpers.DIRECTION_FREE_TYPES` was wrong - a
+    plus-strand annotation records no direction on any type, and 3,293 instances of
+    rep_origin, protein_bind, promoter, terminator and 5'UTR sit reversed while
+    annotated +1, which aligned `pRO1600 oriV` against its own reverse complement and
+    scored it 45% divergent. The extraction is strand-aware, so a `complement()` that
+    was written is already inside the sequence the call is made on.
     """
     uid_df = pl.read_parquet(OUT_UNIQUE_SEQUENCE_IDS)
     FASTA_ORIENTED_DIR.mkdir(parents=True, exist_ok=True)
@@ -153,12 +158,12 @@ def assign_sequence_orientation() -> None:
                     "containment": containments[unique_id],
                 })
 
-        # Only direction-free types are reoriented for the alignment: the rest carry
-        # a strand of their own, which is not ours to overrule.
-        reorient = element_type in helpers.DIRECTION_FREE_TYPES
+        # Every type is reoriented: the alignment must measure divergence, never
+        # orientation. Two variants that are reverse complements of one another
+        # become identical here, which is what the divergence should report.
         fasta_lines = []
         for unique_id, sequence in records.items():
-            if reorient and orientation_of.get(unique_id, 1) == -1:
+            if orientation_of.get(unique_id, 1) == -1:
                 sequence = str(Seq(sequence).reverse_complement())
             fasta_lines.append(f">{unique_id}\n{sequence}\n")
 
@@ -183,18 +188,19 @@ def assign_sequence_orientation() -> None:
     instances.write_parquet(OUT_INSTANCE_ORIENTATION)
 
     reversed_by_type = (
-        instances.filter(pl.col("element_type").is_in(list(helpers.DIRECTION_FREE_TYPES)))
-        .group_by("element_type")
+        instances.group_by("element_type")
         .agg(
             pl.len().alias("instances"),
             (pl.col("sequence_orientation") == -1).sum().alias("reversed"),
         )
+        .filter(pl.col("reversed") > 0)
         .sort("reversed", descending=True)
     )
     print(
         f"Oriented {variants.height} variants across "
         f"{variants.select(['element_type', 'element_name']).n_unique()} elements; "
-        f"{int(reversed_by_type['reversed'].sum())} instances of direction-free types are reversed"
+        f"{int(reversed_by_type['reversed'].sum())} instances are reversed and are "
+        f"reverse-complemented for the alignment and flipped by `load_oriented_elements`"
     )
     print(reversed_by_type)
 
@@ -495,6 +501,11 @@ def make_and_analyze_msa():
                 "identity_to_consensus": ind_identity
             })
 
+        # Distinct sequences, not alignment rows: reorienting makes two variants that
+        # were reverse complements of each other identical, and an element whose
+        # divergence is 0% has one sequence however many rows carry it.
+        n_distinct = len({str(record.seq).replace("-", "") for record in alignment})
+
         aggregated_metrics.append({
             "element_type": element_type,  # uses the last extracted type/name, valid as they are grouped by file
             "element_name": element_name,
@@ -502,7 +513,7 @@ def make_and_analyze_msa():
             "consensus_seq": consensus_str,
             "avg_identity": float(np.mean(identities)),
             "n_instances_total": n_instances_total,
-            "n_instances_unique": len(alignment),
+            "n_instances_unique": n_distinct,
             "alignment_length": alignment.get_alignment_length()
         })
 
@@ -684,6 +695,11 @@ def make_and_analyze_msa_cds():
                 "nuc_avg_identity": nuc_avg_identity
             })
 
+        # Distinct sequences, as in the nucleotide path. Here the variants are grouped
+        # by amino acid sequence to begin with, so this equals the row count; it is
+        # written the same way so the column carries one meaning in both tables.
+        n_distinct = len({str(record.seq).replace("-", "") for record in alignment})
+
         aggregated_metrics.append({
             "element_type": element_type,  # uses the last extracted type/name, valid as they are grouped by file
             "element_name": element_name,
@@ -691,7 +707,7 @@ def make_and_analyze_msa_cds():
             "consensus_seq": consensus_str,
             "avg_identity": float(np.mean(identities)),
             "n_instances_total": n_instances_total,
-            "n_instances_unique": len(alignment),
+            "n_instances_unique": n_distinct,
             "alignment_length": alignment.get_alignment_length()
         })
 
@@ -707,17 +723,16 @@ def get_representative_sequence(plasmid_citations: pl.DataFrame, flank_size: int
     pmid_map = dict(zip(plasmid_citations["gbk_name"].to_list(), plasmid_citations["citing_pmids"].to_list())) 
     element_records = defaultdict(list) 
 
-    # Direction-free feature types carry no strand in the GenBank files, so a
-    # reversed instance would have its window saved in the wrong orientation. Their
-    # sequence orientation is looked up here and composed with the annotated strand.
+    # An instance annotated +1 that actually sits reversed would have its window saved
+    # in the wrong orientation, which happens on every feature type and not only the
+    # direction-free ones. The sequence orientation is looked up here for all of them
+    # and composed with the annotated strand.
     sequence_orientation = {
         (
             row["gbk_name"], row["element_type"], row["element_name"],
             tuple(tuple(part) for part in row["intervals"]),
         ): row["sequence_orientation"]
-        for row in pl.read_parquet(OUT_INSTANCE_ORIENTATION)
-        .filter(pl.col("element_type").is_in(list(helpers.DIRECTION_FREE_TYPES)))
-        .iter_rows(named=True)
+        for row in pl.read_parquet(OUT_INSTANCE_ORIENTATION).iter_rows(named=True)
     }
 
     for record in tqdm(SeqIO.parse(COMBINED_GBK, "genbank"), total=N_PLASMIDS): 
@@ -794,14 +809,14 @@ def get_representative_sequence(plasmid_citations: pl.DataFrame, flank_size: int
 
             # Safely capture strand direction
             strand = feat.location.strand if feat.location.strand is not None else 1
-            if e_type in helpers.DIRECTION_FREE_TYPES:
-                instance_key = (
-                    gbk_name, e_type, e_name,
-                    tuple((int(p.start), int(p.end)) for p in feat.location.parts),
-                )
-                # Orientation is relative to strand-aware extraction, so it composes
-                # with the annotated strand rather than replacing it.
-                strand = strand * sequence_orientation.get(instance_key, 1)
+            instance_key = (
+                gbk_name, e_type, e_name,
+                tuple((int(p.start), int(p.end)) for p in feat.location.parts),
+            )
+            # Orientation is relative to strand-aware extraction, so it composes with
+            # the annotated strand rather than replacing it. Applied to every type:
+            # an instance annotated +1 that sits reversed carries no direction at all.
+            strand = strand * sequence_orientation.get(instance_key, 1)
 
             # 5. Build string with case demarcations (Body = Upper, Gap / Flank = Lower) 
             chars = [] 
