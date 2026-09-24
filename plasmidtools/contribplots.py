@@ -9,8 +9,10 @@ from .statplots import FONT_SIZES
 # y-range alone decides how stretched the letters look.
 LOGO_IN_PER_BP = 18 / 200
 LOGO_FIG_HEIGHT = 8
-# Tallest letter drawn no thinner than this height:width ratio. A typical page sits
-# near 25:1; the cap only reaches the pages that fit a strong stack into a short axis.
+# Tallest letter drawn no thinner than this height:width ratio. A typical CREST page
+# sits near 15:1; the cap only reaches the pages that fit a strong stack into a short
+# axis - the 18 strongest CREST pages, and every Puffin one, which has no usable
+# shared range to sit on.
 MAX_LETTER_ASPECT = 30
 
 
@@ -31,8 +33,8 @@ def contribution_scores_plot(
     scores: np.ndarray,
     tacs_window: int = 5,
     per_pos_threshold: float | None = 0.15,
-    y_min: float = -0.3,
-    y_max: float = 0.6,
+    y_min: float = -0.4,
+    y_max: float = 1.1,
     cre_label: str = "CRE",
     fit_data: bool = True,
 ) -> tuple[plt.Figure, plt.Axes]:
@@ -47,7 +49,9 @@ def contribution_scores_plot(
     With `fit_data`, `y_min` / `y_max` are the narrowest range drawn: they widen to
     fit the logo stacks and the TACS track when those exceed it, so a strong element
     is not clipped while weak ones keep a common scale. The defaults suit CREST,
-    whose letter stacks on plasmid elements peak at 0.25 (median) to 0.88.
+    whose letter stacks on plasmid elements peak at 0.25 (median) to 0.88; the range
+    reaches well above that, because a base is always LOGO_IN_PER_BP wide, so a range
+    that hugs the data draws every letter as a spike.
 
     Fitting a strong stack into a short axis is what makes glyphs unreadable, so the
     range is then stretched further if needed to hold the tallest letter at

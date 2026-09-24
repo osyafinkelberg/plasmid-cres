@@ -41,10 +41,13 @@ CONTRIB_FORMAT = 1
 MIN_PLOT_DISTANCE = 200
 
 # Narrowest y-ranges drawn; `contribution_scores_plot` widens them to fit the data.
-# CREST pages share one range (widened on 12 of 256), so CRE strength compares
-# across elements. Puffin letter stacks span 3.4-185 between pages, which no shared
-# range suits, so this is only a floor and each page fits its own data.
-CREST_Y_RANGE = (-0.3, 0.6)
+# CREST pages share one range, set above the data (stacks peak at 0.88) so the
+# letters keep readable proportions rather than being stretched into spikes: 237 of
+# 256 pages are drawn on it exactly, 1 is widened to fit and the 18 tallest are
+# stretched by the letter-aspect cap, so CRE strength compares across elements.
+# Puffin letter stacks span 3.4-185 between pages, which no shared range suits, so
+# that one is only a floor and each page fits its own data.
+CREST_Y_RANGE = (-0.4, 1.1)
 PUFFIN_Y_RANGE = (-5.0, 10.0)
 # Per-bp TACS threshold line; the 0.15 was never calibrated on Puffin's scale.
 CREST_TACS_THRESHOLD = 0.15
